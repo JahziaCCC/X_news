@@ -3,7 +3,7 @@ name: X_news (RSS Monitor)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # كل 15 دقيقة (توقيت GitHub = UTC)
+    - cron: "*/15 * * * *"   # كل 15 دقيقة (UTC)
 
 permissions:
   contents: write
@@ -33,7 +33,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
         run: |
           python scripts/x_accounts_monitor.py
 
