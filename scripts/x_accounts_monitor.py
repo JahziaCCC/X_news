@@ -23,7 +23,6 @@ ACCOUNTS = [
     "KSAMOFA",
 ]
 
-# Preferred RSSHub instance (optional)
 PREFERRED_RSSHUB = (os.getenv("RSSHUB_BASE") or "").strip().rstrip("/")
 
 RSSHUB_INSTANCES = [
@@ -43,12 +42,15 @@ STATE_PATH = Path("state_x_accounts.json")
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
-SEND_NO_NEW_SUMMARY = False          # True = يرسل "لا يوجد جديد"
+SEND_NO_NEW_SUMMARY = False
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 3                    # ✅ فلترة: آخر 3 ساعات فقط (KSA)
 
-UA = "Mozilla/5.0 (compatible; X_news/3.0; +https://github.com/)"
-X_URL_RE = re.compile(r"https?://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/\d+")
+MAX_AGE_HOURS = 3  # آخر 3 ساعات فقط
+STRICT_AUTHOR_ONLY = True  # ✅ لا يرسل إلا تغريدة "صادرة من الحساب نفسه"
+
+UA = "Mozilla/5.0 (compatible; X_news/4.0; +https://github.com/)"
+X_STATUS_RE = re.compile(r"https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)")
+X_ANY_URL_RE = re.compile(r"https?://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/\d+")
 
 
 def now_ksa() -> datetime:
@@ -88,11 +90,7 @@ def telegram_send(message: str) -> None:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secrets.")
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": False,
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False}
     r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
 
@@ -106,21 +104,33 @@ def is_probably_xml(text: str) -> bool:
     return ("<?xml" in head) or ("<rss" in head) or ("<feed" in head)
 
 
-def extract_x_link(*chunks: str) -> str:
+def extract_any_x_link(*chunks: str) -> str:
     for c in chunks:
         if not c:
             continue
-        m = X_URL_RE.search(c)
+        m = X_ANY_URL_RE.search(c)
         if m:
             return m.group(0)
     return ""
 
 
+def is_link_from_account(x_link: str, username: str) -> bool:
+    """
+    ✅ يتحقق أن الرابط نفسه صادر من الحساب:
+    https://x.com/<username>/status/<id>
+    """
+    if not x_link:
+        return False
+    m = X_STATUS_RE.search(x_link)
+    if not m:
+        return False
+    author = m.group(1)
+    return author.lower() == username.lower()
+
+
 def resolve_final_url(url: str) -> str:
     """
-    Try to resolve Google News redirect to the final destination.
-    If we can reach an x.com/status URL, return it.
-    Otherwise return empty.
+    يحاول يحوّل رابط Google News إلى الوجهة النهائية (ويستخرج x.com/status إن وجد).
     """
     if not url or not url.startswith("http"):
         return ""
@@ -132,41 +142,31 @@ def resolve_final_url(url: str) -> str:
             allow_redirects=True,
         )
         final = (r.url or "").strip()
-        if X_URL_RE.search(final):
+        if X_ANY_URL_RE.search(final):
             return final
 
-        # Sometimes the response HTML contains the final URL
         txt = (r.text or "")[:8000]
-        found = extract_x_link(txt)
+        found = extract_any_x_link(txt)
         return found or ""
     except Exception:
         return ""
 
 
 def entry_time_ksa(entry) -> datetime | None:
-    """
-    Convert entry published/updated time to KSA datetime.
-    If missing, return None.
-    """
     dt_utc = None
     if getattr(entry, "published_parsed", None):
         dt_utc = datetime(*entry.published_parsed[:6], tzinfo=ZoneInfo("UTC"))
     elif getattr(entry, "updated_parsed", None):
         dt_utc = datetime(*entry.updated_parsed[:6], tzinfo=ZoneInfo("UTC"))
-
     if not dt_utc:
         return None
     return dt_utc.astimezone(KSA_TZ)
 
 
 def is_recent(entry) -> bool:
-    """
-    Keep only entries within MAX_AGE_HOURS.
-    If entry has no time, we skip it (to prevent old noise).
-    """
     t = entry_time_ksa(entry)
     if not t:
-        return False
+        return False  # بدون وقت = نرفضه عشان ما يجيب قديم
     return t >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
 
 
@@ -192,7 +192,7 @@ def fetch_rsshub_feed(username: str):
             content = (r.text or "").strip()
             if not is_probably_xml(content):
                 hint = content.lstrip()[:120].replace("\n", " ")
-                last_err = f"Non-XML response (likely blocked/HTML). Hint: {hint}"
+                last_err = f"Non-XML response (blocked/HTML). Hint: {hint}"
                 continue
 
             feed = feedparser.parse(content)
@@ -211,14 +211,10 @@ def fetch_rsshub_feed(username: str):
 
 
 def google_news_feed_url_for_user(username: str) -> str:
-    # We bias recency via query operators:
-    # - 'when:1d' often helps reduce old items (not perfect).
-    q = f'site:x.com "{username}" (status OR /status/) when:1d'
-    return (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(q)
-        + "&hl=ar&gl=SA&ceid=SA:ar"
-    )
+    # ✅ نخلي البحث أدق: الروابط تكون داخل مسار الحساب نفسه
+    # هذا يقلل mentions كثير
+    q = f'site:x.com/{username}/status when:1d'
+    return "https://news.google.com/rss/search?q=" + quote_plus(q) + "&hl=ar&gl=SA&ceid=SA:ar"
 
 
 def fetch_google_news_feed(username: str):
@@ -237,18 +233,14 @@ def fetch_google_news_feed(username: str):
 
 
 def build_message(username: str, text: str, link: str, source_tag: str, entry_dt: datetime | None) -> str:
-    time_line = now_ksa_str()
-    if entry_dt:
-        # show tweet/news time in KSA to prove recency
-        time_line = entry_dt.strftime("%Y-%m-%d | %H:%M") + " KSA"
-
+    time_line = entry_dt.strftime("%Y-%m-%d | %H:%M") + " KSA" if entry_dt else now_ksa_str()
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
         f"🕒 {time_line}\n"
         "════════════════════\n"
         f"📌 الحساب: @{username}\n"
         f"🧩 المصدر: {source_tag}\n\n"
-        "📝 التغريدة/المحتوى:\n"
+        "📝 التغريدة:\n"
         f"{text}\n\n"
         "🔗 رابط التغريدة:\n"
         f"{link}\n"
@@ -256,25 +248,9 @@ def build_message(username: str, text: str, link: str, source_tag: str, entry_dt
     )
 
 
-def build_error_message(username: str, where: str, err: str) -> str:
-    return (
-        "⚠️ رصد منصة X — تعذر قراءة التغريدات\n"
-        f"🕒 {now_ksa_str()}\n"
-        "════════════════════\n"
-        f"📌 الحساب: @{username}\n"
-        f"🔗 المصدر: {where}\n"
-        f"🧾 السبب: {err}\n"
-        "════════════════════"
-    )
-
-
 def entries_new_since(entries, last_seen, limit):
-    """
-    - Stops when reaches last_seen (duplicate barrier)
-    - Filters ONLY recent entries (last 3 hours)
-    """
     collected = []
-    for e in entries[: limit * 10]:
+    for e in entries[: limit * 12]:
         eid = getattr(e, "id", None) or getattr(e, "link", None)
         if not eid:
             continue
@@ -282,7 +258,6 @@ def entries_new_since(entries, last_seen, limit):
             break
         if is_recent(e):
             collected.append(e)
-    # send oldest -> newest
     return list(reversed(collected))[:limit]
 
 
@@ -293,33 +268,28 @@ def main():
     for username in ACCOUNTS:
         last_seen = state.get(username)
 
-        # 1) Try RSSHub
+        # 1) RSSHub
         feed, used_url, err = fetch_rsshub_feed(username)
         source_tag = "RSSHub"
 
-        # 2) Fallback to Google News RSS
+        # 2) Google fallback
         if err or feed is None:
             feed, used_url_g, err_g = fetch_google_news_feed(username)
             source_tag = "Google News RSS (Fallback)"
             if err_g or feed is None:
-                telegram_send(build_error_message(username, used_url, f"RSSHub failed: {err} | Google failed: {err_g}"))
-                time.sleep(1.0)
+                # لا نرسل أخطاء كثيرة — نكمل بهدوء
                 continue
             used_url = used_url_g
 
         entries = list(getattr(feed, "entries", []) or [])
         new_entries = entries_new_since(entries, last_seen, MAX_ITEMS_PER_ACCOUNT)
 
-        # ✅ Update state to newest entry even if we didn't send (prevents re-check spam)
+        # تحديث state دائمًا لمنع تكرار مزعج
         if entries:
             newest = entries[0]
             newest_id = getattr(newest, "id", None) or getattr(newest, "link", None)
             if newest_id:
                 state[username] = newest_id
-
-        # If nothing recent, skip silently
-        if not new_entries:
-            continue
 
         for e in new_entries:
             raw_link = (getattr(e, "link", "") or "").strip()
@@ -327,15 +297,20 @@ def main():
             summary_raw = getattr(e, "summary", "") or ""
             summary = clean_text(summary_raw)
 
-            # Try extracting x.com link from fields
-            x_link = extract_x_link(raw_link, title, summary_raw, summary)
+            # استخرج رابط X
+            x_link = extract_any_x_link(raw_link, title, summary_raw, summary)
 
-            # If still not found (Google News), resolve redirects
-            if not x_link and "news.google.com" in raw_link:
+            # لو Google News: حاول resolve
+            if (not x_link) and ("news.google.com" in raw_link):
                 x_link = resolve_final_url(raw_link)
 
-            final_link = x_link if x_link else raw_link
+            # ✅ فلترة صارمة: لازم الرابط نفسه يكون من الحساب
+            if STRICT_AUTHOR_ONLY:
+                if not is_link_from_account(x_link, username):
+                    # هذا غالبًا mention/رد على الحساب — نرفضه
+                    continue
 
+            final_link = x_link if x_link else raw_link
             text = title if len(title) >= 10 else summary
             if not text:
                 text = "(لم يظهر نص واضح من المصدر)"
@@ -352,7 +327,7 @@ def main():
             "✅ رصد منصة X — حسابات محددة\n"
             f"🕒 {now_ksa_str()}\n"
             "════════════════════\n"
-            "لا توجد تحديثات جديدة (آخر 3 ساعات).\n"
+            f"لا توجد تغريدات جديدة (آخر {MAX_AGE_HOURS} ساعات) من الحسابات المحددة.\n"
             "════════════════════"
         )
 
