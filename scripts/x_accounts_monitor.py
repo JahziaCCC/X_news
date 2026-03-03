@@ -30,7 +30,7 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 24  # خلها 24 الآن للتأكد
+MAX_AGE_HOURS = 24  # بعد ما يشتغل رجعها 3 لو تبي
 
 # ✅ Debug دائم: يرسل تقرير واحد كل تشغيل
 DEBUG_ALWAYS = True
@@ -116,6 +116,23 @@ def looks_like_rss(text: str) -> bool:
         return False
     return ("<rss" in head) or ("<feed" in head) or ("<?xml" in head)
 
+def sanitize_xml(text: str) -> str:
+    """
+    ✅ Fix: remove BOM/whitespace/garbage before the first '<'
+    to avoid: 'XML declaration not at start of entity'
+    """
+    if not text:
+        return ""
+    # remove BOM
+    text = text.replace("\ufeff", "")
+    # strip leading whitespace/newlines
+    text = text.lstrip(" \t\r\n")
+    # if there is any garbage before first '<', cut it
+    idx = text.find("<")
+    if idx > 0:
+        text = text[idx:]
+    return text
+
 def fetch_user_rss(username: str, debug_lines: list[str]):
     """
     Returns (feed, used_source_name, used_url) or (None, "", "")
@@ -139,17 +156,22 @@ def fetch_user_rss(username: str, debug_lines: list[str]):
             )
 
             ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
-            body = r.text or ""
-            rss_flag = "RSS" if looks_like_rss(body) else "HTML/OTHER"
-            debug_lines.append(f"  - {src['name']}: HTTP {r.status_code} | {ctype or 'no-ctype'} | {rss_flag} | len={len(body)}")
+            body_raw = r.text or ""
+            rss_flag = "RSS" if looks_like_rss(body_raw) else "HTML/OTHER"
+            debug_lines.append(f"  - {src['name']}: HTTP {r.status_code} | {ctype or 'no-ctype'} | {rss_flag} | len={len(body_raw)}")
 
             if r.status_code != 200:
                 continue
-            if not looks_like_rss(body):
-                continue
-            if len(body) < 300:
+
+            if not looks_like_rss(body_raw):
                 continue
 
+            body = sanitize_xml(body_raw)
+            if len(body) < 300:
+                debug_lines.append("    ↳ sanitized body too short")
+                continue
+
+            # parse sanitized XML
             feed = feedparser.parse(body)
             if getattr(feed, "bozo", False):
                 err = getattr(feed, "bozo_exception", None)
@@ -213,7 +235,6 @@ def main():
 
             link = (getattr(e, "link", "") or "").strip()
             m = X_STATUS_RE.search(link)
-            # لازم الرابط يكون من نفس الحساب (منع الردود/المنشن)
             if not m or m.group(1).lower() != username.lower():
                 continue
 
@@ -233,7 +254,6 @@ def main():
 
         debug.append(f"  scanned={scanned} candidates={len(to_send)}")
 
-        # إرسال من الأقدم للأحدث
         for e, text, link in reversed(to_send):
             telegram_send(build_tweet_msg(username, text, link, src_name, entry_time_ksa(e)))
             sent_total += 1
