@@ -6,7 +6,6 @@ import html as htmlmod
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
 
 import requests
 
@@ -30,27 +29,29 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 3  # ✅ آخر 3 ساعات (إذا قدرنا نقرأ وقت التغريدة)
+MAX_AGE_HOURS = 3  # آخر 3 ساعات (إذا قدرنا نقرأ وقت التغريدة)
 
-# Primary & fallback HTML frontends (these may go up/down; we rotate)
+# ✅ لا ترسل رسائل أخطاء إلا إذا فشل كل شيء للحساب
+SEND_ERROR_ONLY_IF_ALL_FAIL = True
+
+# =========================
+# FRONTENDS (ROTATION)
+# =========================
+# ملاحظة: xcancel يحتاج UA=mistique غالبًا
 FRONTENDS = [
     {"name": "xcancel", "base": "https://xcancel.com", "ua": "mistique"},
+    {"name": "xcancel-browser", "base": "https://xcancel.com", "ua": "Mozilla/5.0"},
     {"name": "nitter.poast", "base": "https://nitter.poast.org", "ua": "Mozilla/5.0"},
     {"name": "nitter.privacydev", "base": "https://nitter.privacydev.net", "ua": "Mozilla/5.0"},
+    {"name": "nitter.dashy", "base": "https://nitter.dashy.a3x.dn.nyx.im", "ua": "Mozilla/5.0"},
 ]
 
-# Extract tweet status ids from HTML (account page and tweet page)
 STATUS_ID_RE = re.compile(r"/status/(\d{8,25})")
-
-# Try extracting tweet text
-# (works for many nitter/xcancel layouts; if the site changes, we adjust here)
 TWEET_TEXT_PATTERNS = [
     re.compile(r'(?s)<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
     re.compile(r'(?s)<div[^>]+class="main-tweet"[^>]*>.*?<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
     re.compile(r'(?s)<div[^>]+class="tweet-body"[^>]*>.*?<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
 ]
-
-# Try extracting datetime from HTML
 TIME_DT_RE = re.compile(r'datetime="([^"]+)"')
 
 
@@ -99,14 +100,12 @@ def to_x_link(username: str, status_id: str) -> str:
     return f"https://x.com/{username}/status/{status_id}"
 
 
-def fetch_html_with_fallback(path: str):
+def fetch_html(path: str):
     """
-    Fetch HTML from the first working frontend.
-    Returns: (html_text, frontend_name, base_url)
-    Raises only if ALL fail.
+    Try multiple frontends; return first working HTML.
+    Returns: (html_text, frontend_name)
     """
-    last_err = None
-
+    errors = []
     for f in FRONTENDS:
         base = f["base"].rstrip("/")
         url = f"{base}{path}"
@@ -122,27 +121,24 @@ def fetch_html_with_fallback(path: str):
                 timeout=REQUEST_TIMEOUT,
             )
             if r.status_code != 200:
-                last_err = f"{f['name']} HTTP {r.status_code}"
+                errors.append(f"{f['name']} HTTP {r.status_code}")
                 continue
 
             body = r.text or ""
             if len(body) < 200:
-                last_err = f"{f['name']} empty/short body"
+                errors.append(f"{f['name']} empty/short")
                 continue
 
-            return body, f["name"], base
+            return body, f["name"], errors
 
         except Exception as e:
-            last_err = f"{f['name']} EXC {str(e)[:120]}"
+            errors.append(f"{f['name']} EXC {str(e)[:90]}")
             continue
 
-    raise RuntimeError(last_err or "All frontends failed")
+    raise RuntimeError(" | ".join(errors[:3]) if errors else "All frontends failed")
 
 
 def parse_datetime_from_html(body: str) -> datetime | None:
-    """
-    Best effort: <time datetime="2026-03-03T22:10:00+00:00"> ...
-    """
     m = TIME_DT_RE.search(body or "")
     if not m:
         return None
@@ -160,16 +156,13 @@ def parse_datetime_from_html(body: str) -> datetime | None:
 
 def is_recent(tweet_time: datetime | None) -> bool:
     if not tweet_time:
-        # if we cannot parse time, we still allow (but state prevents repeats)
         return True
     return tweet_time >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
 
 
 def extract_tweet_text(body: str) -> str:
-    if not body:
-        return ""
     for pat in TWEET_TEXT_PATTERNS:
-        m = pat.search(body)
+        m = pat.search(body or "")
         if m:
             txt = clean_html_to_text(m.group(1))
             txt = txt.replace("Show this thread", "").strip()
@@ -179,14 +172,9 @@ def extract_tweet_text(body: str) -> str:
 
 
 def fetch_account_status_ids(username: str, limit: int):
-    """
-    Scrape the account page (author-only timeline) and extract status ids.
-    Returns: (ids_list, source_name)
-    """
-    body, src_name, base = fetch_html_with_fallback(f"/{username}")
+    body, src, errs = fetch_html(f"/{username}")
     ids = STATUS_ID_RE.findall(body)
 
-    # dedupe while keeping order
     seen = set()
     uniq = []
     for sid in ids:
@@ -197,16 +185,12 @@ def fetch_account_status_ids(username: str, limit: int):
         if len(uniq) >= limit * 10:
             break
 
-    return uniq, src_name
+    return uniq, src
 
 
 def fetch_tweet_page(username: str, status_id: str):
-    """
-    Fetch the tweet page from the first working frontend.
-    Returns: (body, source_name)
-    """
-    body, src_name, base = fetch_html_with_fallback(f"/{username}/status/{status_id}")
-    return body, src_name
+    body, src, errs = fetch_html(f"/{username}/status/{status_id}")
+    return body, src
 
 
 def build_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime | None, src_name: str) -> str:
@@ -232,21 +216,19 @@ def main():
         try:
             last_seen = state.get(username)
 
-            ids, src_name = fetch_account_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
+            ids, account_src = fetch_account_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
             if not ids:
-                # لا شيء ظاهر/تعطل الصفحة
+                # لا شيء ظاهر
                 continue
 
             newest_id = ids[0]
 
-            # new only (stop at last_seen)
             new_ids = []
             for sid in ids:
                 if last_seen and sid == last_seen:
                     break
                 new_ids.append(sid)
 
-            # send oldest -> newest
             new_ids = list(reversed(new_ids))[:MAX_ITEMS_PER_ACCOUNT]
 
             for sid in new_ids:
@@ -255,7 +237,6 @@ def main():
                 tweet_html, tweet_src = fetch_tweet_page(username, sid)
                 tweet_time = parse_datetime_from_html(tweet_html)
 
-                # ✅ فلترة آخر 3 ساعات إذا قدرنا نقرأ الوقت
                 if tweet_time and not is_recent(tweet_time):
                     continue
 
@@ -266,23 +247,22 @@ def main():
                 telegram_send(build_msg(username, tweet_text, x_link, tweet_time, f"{tweet_src} (author-only)"))
                 time.sleep(1.2)
 
-            # update state even if 0 sent (prevents repeats and looping)
             state[username] = newest_id
 
         except Exception as e:
-            # ✅ لا تفشل الـ workflow بسبب حساب واحد
-            # ارسل رسالة خطأ مختصرة وكمل الباقي
-            try:
-                telegram_send(
-                    "⚠️ رصد منصة X — تعذر الرصد لحساب\n"
-                    f"🕒 {now_ksa_str()}\n"
-                    "════════════════════\n"
-                    f"📌 الحساب: @{username}\n"
-                    f"🧾 السبب: {str(e)[:180]}\n"
-                    "════════════════════"
-                )
-            except Exception:
-                pass
+            # ✅ لا ترسل خطأ إلا إذا تبغى
+            if SEND_ERROR_ONLY_IF_ALL_FAIL:
+                try:
+                    telegram_send(
+                        "⚠️ رصد منصة X — تعذر الرصد لحساب\n"
+                        f"🕒 {now_ksa_str()}\n"
+                        "════════════════════\n"
+                        f"📌 الحساب: @{username}\n"
+                        f"🧾 السبب: {str(e)[:180]}\n"
+                        "════════════════════"
+                    )
+                except Exception:
+                    pass
             continue
 
     save_state(state)
