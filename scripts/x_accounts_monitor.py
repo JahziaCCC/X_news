@@ -22,28 +22,22 @@ ACCOUNTS = [
     "KSAMOFA",
 ]
 
-# RSSHub official/public instance by default
-# You can override via GitHub Secret: RSSHUB_BASE
-RSSHUB_BASE = os.getenv("RSSHUB_BASE", "https://rsshub.app").rstrip("/")
+# IMPORTANT FIX:
+# If RSSHUB_BASE env var is missing OR empty, fallback to default.
+RSSHUB_BASE = (os.getenv("RSSHUB_BASE") or "https://rsshub.app").strip().rstrip("/")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-# State file to prevent duplicates
 STATE_PATH = Path("state_x_accounts.json")
-
-# Timezone (Saudi Arabia)
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
-# Limits
-MAX_ITEMS_PER_ACCOUNT = 3          # max sends per account each run
-SEND_NO_NEW_SUMMARY = False        # set True if you want "no new tweets" message
+MAX_ITEMS_PER_ACCOUNT = 3
+SEND_NO_NEW_SUMMARY = False  # اجعلها True إذا تبي رسالة "لا يوجد جديد"
 
 
 def now_ksa_str() -> str:
     dt = datetime.now(tz=KSA_TZ)
-    # Example: الثلاثاء | 2026-03-03 | 23:48 KSA
-    # We'll output day name in Arabic-ish style? GitHub runner locale is EN, so keep it numeric + KSA label.
     return dt.strftime("%Y-%m-%d | %H:%M") + " KSA"
 
 
@@ -64,7 +58,7 @@ def clean_text(s: str) -> str:
     if not s:
         return ""
     s = html.unescape(s)
-    s = re.sub(r"<[^>]+>", "", s)  # strip html tags
+    s = re.sub(r"<[^>]+>", "", s)  # strip html
     s = re.sub(r"\s+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
@@ -85,7 +79,6 @@ def telegram_send(message: str) -> None:
 
 
 def fetch_feed(username: str):
-    # RSSHub route: /twitter/user/:id
     feed_url = f"{RSSHUB_BASE}/twitter/user/{username}"
     return feedparser.parse(feed_url), feed_url
 
@@ -104,34 +97,36 @@ def build_message(username: str, text: str, link: str) -> str:
     )
 
 
+def build_error_message(username: str, feed_url: str, err: str) -> str:
+    return (
+        "⚠️ رصد منصة X (RSS) — تعذر قراءة التغريدات\n"
+        f"🕒 {now_ksa_str()}\n"
+        "════════════════════\n"
+        f"📌 الحساب: @{username}\n"
+        f"🔗 المصدر: {feed_url}\n"
+        f"🧾 السبب: {err[:180] if err else 'Unknown'}\n"
+        "════════════════════"
+    )
+
+
 def main():
     state = load_state()
     sent_any = False
 
     for username in ACCOUNTS:
-        last_seen = state.get(username)  # stores the newest entry id/link we recorded
+        last_seen = state.get(username)
 
         feed, feed_url = fetch_feed(username)
 
-        # If RSS parsing failed
         if getattr(feed, "bozo", False):
             err = getattr(feed, "bozo_exception", None)
-            msg = (
-                "⚠️ رصد منصة X (RSS) — تعذر قراءة التغريدات\n"
-                f"🕒 {now_ksa_str()}\n"
-                "════════════════════\n"
-                f"📌 الحساب: @{username}\n"
-                f"🔗 المصدر: {feed_url}\n"
-                f"🧾 السبب: {str(err)[:180] if err else 'Unknown'}\n"
-                "════════════════════"
-            )
-            telegram_send(msg)
+            telegram_send(build_error_message(username, feed_url, str(err)))
             time.sleep(1.0)
             continue
 
         entries = list(getattr(feed, "entries", []) or [])
 
-        # Collect new entries until we hit last_seen
+        # Collect new entries until last_seen
         new_entries = []
         for e in entries[: MAX_ITEMS_PER_ACCOUNT * 6]:
             eid = getattr(e, "id", None) or getattr(e, "link", None)
@@ -141,15 +136,14 @@ def main():
                 break
             new_entries.append(e)
 
-        # Send from oldest to newest
+        # Send oldest -> newest
         new_entries = list(reversed(new_entries))[:MAX_ITEMS_PER_ACCOUNT]
 
         for e in new_entries:
-            link = getattr(e, "link", "") or ""
+            link = (getattr(e, "link", "") or "").strip()
             title = clean_text(getattr(e, "title", "") or "")
             summary = clean_text(getattr(e, "summary", "") or "")
 
-            # Prefer title if it looks like actual tweet text
             text = title if len(title) >= 10 else summary
             if not text:
                 text = "(لم يظهر نص واضح من مصدر RSS)"
@@ -158,7 +152,7 @@ def main():
             sent_any = True
             time.sleep(1.2)
 
-        # Update state to newest item in feed (most recent)
+        # Update state with newest entry
         if entries:
             newest = entries[0]
             newest_id = getattr(newest, "id", None) or getattr(newest, "link", None)
