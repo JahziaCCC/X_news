@@ -9,9 +9,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-# =========================
-# CONFIG
-# =========================
 ACCOUNTS = [
     "SaudiNews50",
     "alekhbariyatv",
@@ -32,11 +29,9 @@ MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
 MAX_AGE_HOURS = 3
 
-# retry inside the same run
 PER_REQUEST_RETRIES = 2
 RETRY_SLEEP_SECONDS = 6
 
-# تشغيل هادئ + ملخص واحد
 SEND_RUN_SUMMARY = True
 
 FRONTENDS = [
@@ -78,8 +73,6 @@ def save_state(state: dict) -> None:
 
 
 def telegram_send(message: str, preview: bool = False) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secrets.")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": (not preview)}
     r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
@@ -102,10 +95,6 @@ def to_x_link(username: str, status_id: str) -> str:
 
 
 def fetch_html(path: str):
-    """
-    Try multiple frontends with retry.
-    Returns: (html_text, frontend_name) or raises.
-    """
     for f in FRONTENDS:
         base = f["base"].rstrip("/")
         url = f"{base}{path}"
@@ -177,7 +166,7 @@ def extract_tweet_text(body: str) -> str:
 
 
 def fetch_account_status_ids(username: str, limit: int):
-    body, src = fetch_html(f"/{username}")
+    body, _ = fetch_html(f"/{username}")
     ids = STATUS_ID_RE.findall(body)
 
     seen = set()
@@ -194,7 +183,7 @@ def fetch_account_status_ids(username: str, limit: int):
 
 
 def fetch_tweet_page(username: str, status_id: str):
-    body, src = fetch_html(f"/{username}/status/{status_id}")
+    body, _ = fetch_html(f"/{username}/status/{status_id}")
     return body
 
 
@@ -218,13 +207,18 @@ def main():
     checked = 0
     sent = 0
 
+    lines = []
+
     for username in ACCOUNTS:
         checked += 1
         try:
             last_seen = state.get(username)
 
             ids = fetch_account_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
+            ids_found = len(ids)
+
             if not ids:
+                lines.append(f"@{username}: ids=0")
                 continue
 
             newest_id = ids[0]
@@ -237,22 +231,25 @@ def main():
 
             new_ids = list(reversed(new_ids))[:MAX_ITEMS_PER_ACCOUNT]
 
+            blocked_time = 0
             for sid in new_ids:
                 tweet_html = fetch_tweet_page(username, sid)
                 tweet_time = parse_datetime_from_html(tweet_html)
 
                 if tweet_time and not is_recent(tweet_time):
+                    blocked_time += 1
                     continue
 
                 tweet_text = extract_tweet_text(tweet_html) or f"(تغريدة جديدة من @{username})"
                 telegram_send(build_tweet_msg(username, tweet_text, to_x_link(username, sid), tweet_time), preview=True)
                 sent += 1
-                time.sleep(1.1)
+                time.sleep(1.0)
 
             state[username] = newest_id
+            lines.append(f"@{username}: ids={ids_found} new={len(new_ids)} blocked_time={blocked_time}")
 
         except Exception:
-            # Silent: لا ترسل أخطاء ولا توقف
+            lines.append(f"@{username}: fail")
             continue
 
     save_state(state)
@@ -264,7 +261,8 @@ def main():
             "════════════════════\n"
             f"✅ Checked: {checked}\n"
             f"📤 Sent: {sent}\n"
-            "════════════════════",
+            "════════════════════\n"
+            + "\n".join(lines[:12]),
             preview=False
         )
 
