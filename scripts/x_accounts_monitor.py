@@ -36,11 +36,13 @@ MAX_AGE_HOURS = 3
 PER_REQUEST_RETRIES = 2
 RETRY_SLEEP_SECONDS = 6
 
+# تشغيل هادئ + ملخص واحد
+SEND_RUN_SUMMARY = True
+
 FRONTENDS = [
     {"name": "xcancel", "base": "https://xcancel.com", "ua": "mistique"},
     {"name": "xcancel-browser", "base": "https://xcancel.com", "ua": "Mozilla/5.0"},
     {"name": "nitter.poast", "base": "https://nitter.poast.org", "ua": "Mozilla/5.0"},
-    {"name": "nitter.privacydev", "base": "https://nitter.privacydev.net", "ua": "Mozilla/5.0"},
     {"name": "nitter.dashy", "base": "https://nitter.dashy.a3x.dn.nyx.im", "ua": "Mozilla/5.0"},
 ]
 
@@ -75,11 +77,11 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def telegram_send(message: str) -> None:
+def telegram_send(message: str, preview: bool = False) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secrets.")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": (not preview)}
     r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
 
@@ -196,7 +198,7 @@ def fetch_tweet_page(username: str, status_id: str):
     return body
 
 
-def build_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime | None) -> str:
+def build_tweet_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime | None) -> str:
     time_line = tweet_time.strftime("%Y-%m-%d | %H:%M") + " KSA" if tweet_time else now_ksa_str()
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
@@ -213,8 +215,11 @@ def build_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime 
 
 def main():
     state = load_state()
+    checked = 0
+    sent = 0
 
     for username in ACCOUNTS:
+        checked += 1
         try:
             last_seen = state.get(username)
 
@@ -240,16 +245,28 @@ def main():
                     continue
 
                 tweet_text = extract_tweet_text(tweet_html) or f"(تغريدة جديدة من @{username})"
-                telegram_send(build_msg(username, tweet_text, to_x_link(username, sid), tweet_time))
-                time.sleep(1.2)
+                telegram_send(build_tweet_msg(username, tweet_text, to_x_link(username, sid), tweet_time), preview=True)
+                sent += 1
+                time.sleep(1.1)
 
             state[username] = newest_id
 
         except Exception:
-            # ✅ Silent: لا ترسل أخطاء ولا توقف
+            # Silent: لا ترسل أخطاء ولا توقف
             continue
 
     save_state(state)
+
+    if SEND_RUN_SUMMARY:
+        telegram_send(
+            "🧪 ملخص تشغيل X_news\n"
+            f"🕒 {now_ksa_str()}\n"
+            "════════════════════\n"
+            f"✅ Checked: {checked}\n"
+            f"📤 Sent: {sent}\n"
+            "════════════════════",
+            preview=False
+        )
 
 
 if __name__ == "__main__":
