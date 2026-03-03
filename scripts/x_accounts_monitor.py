@@ -30,34 +30,30 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 24  # بعد ما يشتغل عندك رجّعها 3
+MAX_AGE_HOURS = 24  # خلها 24 الآن للتأكد
+
+# ✅ Debug دائم: يرسل تقرير واحد كل تشغيل
+DEBUG_ALWAYS = True
+
+UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/DEBUG)"
+X_STATUS_RE = re.compile(r"https?://(?:x\.com|twitter\.com|xcancel\.com|twitt\.re|nitter\.[^/]+)/([A-Za-z0-9_]+)/status/(\d+)")
 
 # =========================
 # RSS FRONTENDS (ROTATION)
 # =========================
-# ملاحظة: xcancel/xcancel RSS قد يحتاج User-Agent = "mistique" عشان ما يطلع فاضي/محجوب.  [oai_citation:2‡GitHub](https://github.com/zedeus/nitter/issues/1353?utm_source=chatgpt.com)
-# وبعض الـ instances “تجي وتمشي”، فحطّيت مجموعة معروفة + من قائمة instances.  [oai_citation:3‡Gist](https://gist.github.com/cmj/7dace466c983e07d4e3b13be4b786c29?utm_source=chatgpt.com)
 FEED_SOURCES = [
-    {"name": "xcancel.com", "base": "https://xcancel.com", "ua": "mistique"},
-    {"name": "xcancel.com (browser UA)", "base": "https://xcancel.com", "ua": "Mozilla/5.0"},
-    {"name": "xcancel.com (alt)", "base": "https://xcancel.com", "ua": "mistique", "path": "/{user}/rss"},
-    {"name": "twitt.re", "base": "https://twitt.re", "ua": "Mozilla/5.0"},
-    {"name": "nitter.privacydev.net", "base": "https://nitter.privacydev.net", "ua": "Mozilla/5.0"},
-    {"name": "nitter.poast.org", "base": "https://nitter.poast.org", "ua": "Mozilla/5.0"},
-    {"name": "nitter.dashy.a3x.dn.nyx.im", "base": "https://nitter.dashy.a3x.dn.nyx.im", "ua": "Mozilla/5.0"},
+    {"name": "xcancel.com (mistique UA)", "base": "https://xcancel.com", "ua": "mistique", "path": "/{user}/rss"},
+    {"name": "xcancel.com (browser UA)", "base": "https://xcancel.com", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
+    {"name": "twitt.re", "base": "https://twitt.re", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
+    {"name": "nitter.privacydev.net", "base": "https://nitter.privacydev.net", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
+    {"name": "nitter.poast.org", "base": "https://nitter.poast.org", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
 ]
-
-UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/7.0)"
-X_STATUS_RE = re.compile(r"https?://(?:x\.com|twitter\.com|xcancel\.com|twitt\.re|nitter\.[^/]+)/([A-Za-z0-9_]+)/status/(\d+)")
-
 
 def now_ksa() -> datetime:
     return datetime.now(tz=KSA_TZ)
 
-
 def now_ksa_str() -> str:
     return now_ksa().strftime("%Y-%m-%d | %H:%M") + " KSA"
-
 
 def load_state() -> dict:
     if STATE_PATH.exists():
@@ -67,10 +63,8 @@ def load_state() -> dict:
             return {}
     return {}
 
-
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def clean_text(s: str) -> str:
     if not s:
@@ -81,15 +75,13 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-
 def telegram_send(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secrets.")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True}
     r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-
 
 def entry_time_ksa(entry) -> datetime | None:
     dt_utc = None
@@ -101,14 +93,11 @@ def entry_time_ksa(entry) -> datetime | None:
         return None
     return dt_utc.astimezone(KSA_TZ)
 
-
 def is_recent(entry) -> bool:
     t = entry_time_ksa(entry)
     if not t:
-        # بعض الـ RSS ما يعطون وقت؛ نسمح مؤقتًا
         return True
     return t >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
-
 
 def normalize_to_x(link: str) -> str:
     if not link:
@@ -119,33 +108,23 @@ def normalize_to_x(link: str) -> str:
     link = re.sub(r"https?://nitter\.[^/]+/", "https://x.com/", link)
     return link
 
+def looks_like_rss(text: str) -> bool:
+    if not text:
+        return False
+    head = text.lstrip()[:300].lower()
+    if "<html" in head or "<!doctype html" in head:
+        return False
+    return ("<rss" in head) or ("<feed" in head) or ("<?xml" in head)
 
-def build_msg(username: str, text: str, link: str, src: str, entry_dt: datetime | None) -> str:
-    time_line = entry_dt.strftime("%Y-%m-%d | %H:%M") + " KSA" if entry_dt else now_ksa_str()
-    return (
-        "🚨 رصد منصة X — حسابات محددة\n"
-        f"🕒 {time_line}\n"
-        "════════════════════\n"
-        f"📌 الحساب: @{username}\n"
-        f"🧩 المصدر: {src}\n\n"
-        "📝 التغريدة:\n"
-        f"{text}\n\n"
-        "🔗 رابط التغريدة:\n"
-        f"{link}\n"
-        "════════════════════"
-    )
-
-
-def fetch_user_rss(username: str):
+def fetch_user_rss(username: str, debug_lines: list[str]):
     """
-    Try multiple frontends; return (feed, used_url, source_name, errors_list)
+    Returns (feed, used_source_name, used_url) or (None, "", "")
     """
-    errors = []
     for src in FEED_SOURCES:
         base = src["base"].rstrip("/")
         ua = (src.get("ua") or UA_FALLBACK).strip()
-        path_tpl = src.get("path") or "/{user}/rss"
-        url = f"{base}{path_tpl.format(user=username)}"
+        path = (src.get("path") or "/{user}/rss").format(user=username)
+        url = f"{base}{path}"
 
         try:
             r = requests.get(
@@ -159,61 +138,71 @@ def fetch_user_rss(username: str):
                 timeout=REQUEST_TIMEOUT,
             )
 
-            if r.status_code != 200:
-                errors.append(f"{src['name']} HTTP {r.status_code}")
-                continue
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+            body = r.text or ""
+            rss_flag = "RSS" if looks_like_rss(body) else "HTML/OTHER"
+            debug_lines.append(f"  - {src['name']}: HTTP {r.status_code} | {ctype or 'no-ctype'} | {rss_flag} | len={len(body)}")
 
-            body = (r.text or "").strip()
-            # بعضهم يرجّع صفحة فاضية/قصيرة جداً
-            if len(body) < 200:
-                errors.append(f"{src['name']} empty/short body")
+            if r.status_code != 200:
+                continue
+            if not looks_like_rss(body):
+                continue
+            if len(body) < 300:
                 continue
 
             feed = feedparser.parse(body)
             if getattr(feed, "bozo", False):
                 err = getattr(feed, "bozo_exception", None)
-                errors.append(f"{src['name']} parse error: {str(err)[:120] if err else 'Unknown'}")
+                debug_lines.append(f"    ↳ parse bozo: {str(err)[:120] if err else 'Unknown'}")
                 continue
 
-            return feed, url, src["name"], errors
+            return feed, src["name"], url
 
         except Exception as e:
-            errors.append(f"{src['name']} exception: {str(e)[:120]}")
+            debug_lines.append(f"  - {src['name']}: EXC {str(e)[:120]}")
             continue
 
-    return None, "", "", errors
+    return None, "", ""
 
+def build_tweet_msg(username: str, text: str, link: str, src_name: str, entry_dt: datetime | None) -> str:
+    time_line = entry_dt.strftime("%Y-%m-%d | %H:%M") + " KSA" if entry_dt else now_ksa_str()
+    return (
+        "🚨 رصد منصة X — حسابات محددة\n"
+        f"🕒 {time_line}\n"
+        "════════════════════\n"
+        f"📌 الحساب: @{username}\n"
+        f"🧩 المصدر: {src_name}\n\n"
+        "📝 التغريدة:\n"
+        f"{text}\n\n"
+        "🔗 الرابط:\n"
+        f"{link}\n"
+        "════════════════════"
+    )
 
 def main():
     state = load_state()
+    sent_total = 0
+
+    debug = [f"🧪 Debug X_news — {now_ksa_str()}", "════════════════════"]
 
     for username in ACCOUNTS:
-        last_seen = state.get(username)
-
-        feed, used_url, src_name, errors = fetch_user_rss(username)
+        debug.append(f"@{username}:")
+        feed, src_name, used_url = fetch_user_rss(username, debug)
 
         if not feed:
-            # رسالة خطأ مختصرة + أول 3 أخطاء فقط (بدون إزعاج)
-            short_err = " | ".join(errors[:3]) if errors else "Unknown"
-            telegram_send(
-                "⚠️ رصد منصة X — تعذر جلب RSS للحساب\n"
-                f"🕒 {now_ksa_str()}\n"
-                "════════════════════\n"
-                f"📌 الحساب: @{username}\n"
-                f"🧾 السبب: {short_err}\n"
-                "════════════════════"
-            )
-            time.sleep(1.0)
+            debug.append("  => RESULT: ❌ no working RSS source")
             continue
 
         entries = list(getattr(feed, "entries", []) or [])
-        if not entries:
-            continue
+        debug.append(f"  => RESULT: ✅ {src_name} | entries={len(entries)}")
+        last_seen = state.get(username)
 
         newest_id = None
         to_send = []
+        scanned = 0
 
-        for e in entries[: MAX_ITEMS_PER_ACCOUNT * 12]:
+        for e in entries[: 60]:
+            scanned += 1
             eid = getattr(e, "id", None) or getattr(e, "link", None)
             if not eid:
                 continue
@@ -223,8 +212,8 @@ def main():
                 break
 
             link = (getattr(e, "link", "") or "").strip()
-            # ✅ فلترة صارمة: الرابط لازم يكون من نفس الحساب
             m = X_STATUS_RE.search(link)
+            # لازم الرابط يكون من نفس الحساب (منع الردود/المنشن)
             if not m or m.group(1).lower() != username.lower():
                 continue
 
@@ -239,17 +228,27 @@ def main():
 
             to_send.append((e, text, normalize_to_x(link)))
 
+            if len(to_send) >= MAX_ITEMS_PER_ACCOUNT:
+                break
+
+        debug.append(f"  scanned={scanned} candidates={len(to_send)}")
+
         # إرسال من الأقدم للأحدث
-        to_send = list(reversed(to_send))[:MAX_ITEMS_PER_ACCOUNT]
-        for e, text, link in to_send:
-            telegram_send(build_msg(username, text, link, src_name, entry_time_ksa(e)))
-            time.sleep(1.2)
+        for e, text, link in reversed(to_send):
+            telegram_send(build_tweet_msg(username, text, link, src_name, entry_time_ksa(e)))
+            sent_total += 1
+            time.sleep(1.0)
 
         if newest_id:
             state[username] = newest_id
 
     save_state(state)
 
+    debug.append("════════════════════")
+    debug.append(f"sent_total={sent_total}")
+
+    if DEBUG_ALWAYS:
+        telegram_send("\n".join(debug))
 
 if __name__ == "__main__":
     main()
