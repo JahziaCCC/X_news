@@ -31,25 +31,20 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-
-# بعد ما تتأكد أنه صار يرسل، رجعها 3
-MAX_AGE_HOURS = 24
-
-# Debug summary per run
+MAX_AGE_HOURS = 24   # بعد ما يشتغل رجعها 3
 DEBUG_ALWAYS = True
 
-# RSS frontends (we mostly rely on xcancel since it responds 200 for you)
 FEED_SOURCES = [
     {"name": "xcancel.com (mistique UA)", "base": "https://xcancel.com", "ua": "mistique", "path": "/{user}/rss"},
     {"name": "xcancel.com (browser UA)", "base": "https://xcancel.com", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
 ]
 
-UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/8.0)"
+UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/9.0)"
 
-
-# Accept many status URL forms (with or without username)
-STATUS_ID_RE = re.compile(r"/status/(\d+)")
-IWEB_STATUS_ID_RE = re.compile(r"/i/web/status/(\d+)")
+# Match many forms:
+# /status/123..., /i/web/status/123..., twitter/x links in HTML
+STATUS_ID_RE = re.compile(r"(?:/status/|/i/web/status/)(\d{8,25})")
+PLAIN_ID_RE = re.compile(r"\b(\d{12,25})\b")  # fallback: long numeric id in text
 
 
 def now_ksa() -> datetime:
@@ -106,7 +101,6 @@ def entry_time_ksa(entry) -> datetime | None:
 def is_recent(entry) -> bool:
     t = entry_time_ksa(entry)
     if not t:
-        # بعض RSS ما يعطي وقت، نسمح مؤقتًا
         return True
     return t >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
 
@@ -121,7 +115,6 @@ def looks_like_rss(text: str) -> bool:
 
 
 def sanitize_xml(text: str) -> str:
-    # remove BOM + anything before first '<'
     if not text:
         return ""
     text = text.replace("\ufeff", "")
@@ -132,20 +125,64 @@ def sanitize_xml(text: str) -> str:
     return text
 
 
-def extract_status_id(link: str) -> str:
-    if not link:
-        return ""
-    m = STATUS_ID_RE.search(link)
-    if m:
-        return m.group(1)
-    m = IWEB_STATUS_ID_RE.search(link)
-    if m:
-        return m.group(1)
-    return ""
-
-
 def to_x_link(username: str, status_id: str) -> str:
     return f"https://x.com/{username}/status/{status_id}"
+
+
+def _as_str(x) -> str:
+    if x is None:
+        return ""
+    try:
+        return str(x)
+    except Exception:
+        return ""
+
+
+def extract_status_id_from_entry(entry) -> str:
+    """
+    Search status id in:
+    link, id, guid, title, summary, summary_detail, links[]
+    """
+    candidates = []
+
+    candidates.append(_as_str(getattr(entry, "link", "")))
+    candidates.append(_as_str(getattr(entry, "id", "")))
+    candidates.append(_as_str(getattr(entry, "guid", "")))
+    candidates.append(_as_str(getattr(entry, "title", "")))
+    candidates.append(_as_str(getattr(entry, "summary", "")))
+
+    sd = getattr(entry, "summary_detail", None)
+    if sd and isinstance(sd, dict):
+        candidates.append(_as_str(sd.get("value", "")))
+
+    links = getattr(entry, "links", None)
+    if links and isinstance(links, list):
+        for lk in links[:5]:
+            if isinstance(lk, dict):
+                candidates.append(_as_str(lk.get("href", "")))
+            else:
+                candidates.append(_as_str(lk))
+
+    # Normalize relative URLs (some feeds use /i/web/status/..)
+    normalized = []
+    for c in candidates:
+        c = c.strip()
+        if c.startswith("/"):
+            c = urljoin("https://xcancel.com", c)
+        normalized.append(c)
+
+    # 1) Try explicit /status/ or /i/web/status/
+    blob = " | ".join(normalized)
+    m = STATUS_ID_RE.search(blob)
+    if m:
+        return m.group(1)
+
+    # 2) Fallback: look for long numeric id
+    m2 = PLAIN_ID_RE.search(blob)
+    if m2:
+        return m2.group(1)
+
+    return ""
 
 
 def fetch_user_rss(username: str, debug_lines: list[str]):
@@ -236,27 +273,24 @@ def main():
             eid = getattr(e, "id", None) or getattr(e, "link", None)
             if not eid:
                 continue
-
             if newest_id is None:
                 newest_id = eid
-
-            # stop at duplicate barrier
             if last_seen and eid == last_seen:
                 break
 
             if not is_recent(e):
                 continue
 
-            link = (getattr(e, "link", "") or "").strip()
-            # make absolute if it is relative
-            if link.startswith("/"):
-                link = urljoin("https://xcancel.com", link)
-
-            status_id = extract_status_id(link)
+            status_id = extract_status_id_from_entry(e)
             if not status_id:
+                # Debug a tiny peek (only once per account)
+                if scanned == 1:
+                    lk = _as_str(getattr(e, "link", ""))[:120].replace("\n", " ")
+                    ei = _as_str(getattr(e, "id", ""))[:120].replace("\n", " ")
+                    sm = _as_str(getattr(e, "summary", ""))[:120].replace("\n", " ")
+                    debug.append(f"  ↳ no status_id. link='{lk}' id='{ei}' summary='{sm}'")
                 continue
 
-            # ✅ Build clean official x.com link for THIS account timeline
             x_link = to_x_link(username, status_id)
 
             title = clean_text(getattr(e, "title", "") or "")
@@ -266,19 +300,16 @@ def main():
                 text = "(بدون نص واضح)"
 
             candidates.append((e, text, x_link))
-
             if len(candidates) >= MAX_ITEMS_PER_ACCOUNT:
                 break
 
         debug.append(f"  scanned={scanned} candidates={len(candidates)}")
 
-        # send oldest -> newest
         for e, text, x_link in reversed(candidates):
             telegram_send(build_tweet_msg(username, text, x_link, src_name, entry_time_ksa(e)))
             sent_total += 1
             time.sleep(1.0)
 
-        # update state
         if newest_id:
             state[username] = newest_id
 
