@@ -1,13 +1,10 @@
 import os
 import json
-import time
-import re
-import html as htmlmod
-from pathlib import Path
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
+import feedparser
 import requests
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 ACCOUNTS = [
     "SaudiNews50",
@@ -18,253 +15,103 @@ ACCOUNTS = [
     "KSAMOFA",
 ]
 
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-
 STATE_PATH = Path("state_x_accounts.json")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
-MAX_ITEMS_PER_ACCOUNT = 3
-REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 3
-
-PER_REQUEST_RETRIES = 2
-RETRY_SLEEP_SECONDS = 6
-
-SEND_RUN_SUMMARY = True
-
-FRONTENDS = [
-    {"name": "xcancel", "base": "https://xcancel.com", "ua": "mistique"},
-    {"name": "xcancel-browser", "base": "https://xcancel.com", "ua": "Mozilla/5.0"},
-    {"name": "nitter.poast", "base": "https://nitter.poast.org", "ua": "Mozilla/5.0"},
-    {"name": "nitter.dashy", "base": "https://nitter.dashy.a3x.dn.nyx.im", "ua": "Mozilla/5.0"},
-]
-
-STATUS_ID_RE = re.compile(r"/status/(\d{8,25})")
-TIME_DT_RE = re.compile(r'datetime="([^"]+)"')
-
-TWEET_TEXT_PATTERNS = [
-    re.compile(r'(?s)<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
-    re.compile(r'(?s)<div[^>]+class="main-tweet"[^>]*>.*?<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
-    re.compile(r'(?s)<div[^>]+class="tweet-body"[^>]*>.*?<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
-]
+def now_ksa():
+    return datetime.now(KSA_TZ).strftime("%Y-%m-%d | %H:%M KSA")
 
 
-def now_ksa() -> datetime:
-    return datetime.now(tz=KSA_TZ)
+def telegram_send(text):
 
-
-def now_ksa_str() -> str:
-    return now_ksa().strftime("%Y-%m-%d | %H:%M") + " KSA"
-
-
-def load_state() -> dict:
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-
-def save_state(state: dict) -> None:
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def telegram_send(message: str, preview: bool = False) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": (not preview)}
-    r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
 
-
-def clean_html_to_text(s: str) -> str:
-    if not s:
-        return ""
-    s = htmlmod.unescape(s)
-    s = re.sub(r"<br\s*/?>", "\n", s)
-    s = re.sub(r"</p\s*>", "\n", s)
-    s = re.sub(r"<[^>]+>", "", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-
-def to_x_link(username: str, status_id: str) -> str:
-    return f"https://x.com/{username}/status/{status_id}"
-
-
-def fetch_html(path: str):
-    for f in FRONTENDS:
-        base = f["base"].rstrip("/")
-        url = f"{base}{path}"
-
-        for attempt in range(PER_REQUEST_RETRIES + 1):
-            try:
-                r = requests.get(
-                    url,
-                    headers={
-                        "User-Agent": f["ua"],
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "ar,en;q=0.8",
-                        "Referer": base + "/",
-                    },
-                    timeout=REQUEST_TIMEOUT,
-                )
-
-                if r.status_code == 200:
-                    body = r.text or ""
-                    if len(body) >= 200:
-                        return body, f["name"]
-                    break
-
-                if r.status_code in (503, 429) and attempt < PER_REQUEST_RETRIES:
-                    time.sleep(RETRY_SLEEP_SECONDS)
-                    continue
-                break
-
-            except Exception:
-                if attempt < PER_REQUEST_RETRIES:
-                    time.sleep(RETRY_SLEEP_SECONDS)
-                    continue
-                break
-
-    raise RuntimeError("All frontends failed")
-
-
-def parse_datetime_from_html(body: str) -> datetime | None:
-    m = TIME_DT_RE.search(body or "")
-    if not m:
-        return None
-    raw = (m.group(1) or "").strip()
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-        return dt.astimezone(KSA_TZ)
-    except Exception:
-        return None
-
-
-def is_recent(tweet_time: datetime | None) -> bool:
-    if not tweet_time:
-        return True
-    return tweet_time >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
-
-
-def extract_tweet_text(body: str) -> str:
-    for pat in TWEET_TEXT_PATTERNS:
-        m = pat.search(body or "")
-        if m:
-            txt = clean_html_to_text(m.group(1))
-            txt = txt.replace("Show this thread", "").strip()
-            if txt:
-                return txt
-    return ""
-
-
-def fetch_account_status_ids(username: str, limit: int):
-    body, _ = fetch_html(f"/{username}")
-    ids = STATUS_ID_RE.findall(body)
-
-    seen = set()
-    uniq = []
-    for sid in ids:
-        if sid in seen:
-            continue
-        seen.add(sid)
-        uniq.append(sid)
-        if len(uniq) >= limit * 10:
-            break
-
-    return uniq
-
-
-def fetch_tweet_page(username: str, status_id: str):
-    body, _ = fetch_html(f"/{username}/status/{status_id}")
-    return body
-
-
-def build_tweet_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime | None) -> str:
-    time_line = tweet_time.strftime("%Y-%m-%d | %H:%M") + " KSA" if tweet_time else now_ksa_str()
-    return (
-        "🚨 رصد منصة X — حسابات محددة\n"
-        f"🕒 {time_line}\n"
-        "════════════════════\n"
-        f"📌 الحساب: @{username}\n\n"
-        "📝 التغريدة:\n"
-        f"{tweet_text}\n\n"
-        "🔗 رابط التغريدة:\n"
-        f"{x_link}\n"
-        "════════════════════"
+    requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": False,
+        },
     )
 
 
+def load_state():
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text())
+    return {}
+
+
+def save_state(state):
+    STATE_PATH.write_text(json.dumps(state))
+
+
 def main():
+
     state = load_state()
-    checked = 0
+
     sent = 0
 
-    lines = []
+    for acc in ACCOUNTS:
 
-    for username in ACCOUNTS:
-        checked += 1
         try:
-            last_seen = state.get(username)
 
-            ids = fetch_account_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
-            ids_found = len(ids)
+            rss = f"https://rsshub.app/twitter/user/{acc}"
 
-            if not ids:
-                lines.append(f"@{username}: ids=0")
+            feed = feedparser.parse(rss)
+
+            if not feed.entries:
                 continue
 
-            newest_id = ids[0]
+            last_id = state.get(acc)
 
-            new_ids = []
-            for sid in ids:
-                if last_seen and sid == last_seen:
+            for entry in feed.entries[:3]:
+
+                link = entry.link
+
+                tweet_id = link.split("/")[-1]
+
+                if tweet_id == last_id:
                     break
-                new_ids.append(sid)
 
-            new_ids = list(reversed(new_ids))[:MAX_ITEMS_PER_ACCOUNT]
+                text = entry.title
 
-            blocked_time = 0
-            for sid in new_ids:
-                tweet_html = fetch_tweet_page(username, sid)
-                tweet_time = parse_datetime_from_html(tweet_html)
+                msg = f"""🚨 رصد منصة X — حسابات محددة
+🕒 {now_ksa()}
+════════════════════
+📌 الحساب: @{acc}
 
-                if tweet_time and not is_recent(tweet_time):
-                    blocked_time += 1
-                    continue
+📝 التغريدة:
+{text}
 
-                tweet_text = extract_tweet_text(tweet_html) or f"(تغريدة جديدة من @{username})"
-                telegram_send(build_tweet_msg(username, tweet_text, to_x_link(username, sid), tweet_time), preview=True)
+🔗 رابط التغريدة:
+{link}
+════════════════════
+"""
+
+                telegram_send(msg)
+
                 sent += 1
-                time.sleep(1.0)
 
-            state[username] = newest_id
-            lines.append(f"@{username}: ids={ids_found} new={len(new_ids)} blocked_time={blocked_time}")
+            state[acc] = feed.entries[0].link.split("/")[-1]
 
         except Exception:
-            lines.append(f"@{username}: fail")
             continue
 
     save_state(state)
 
-    if SEND_RUN_SUMMARY:
-        telegram_send(
-            "🧪 ملخص تشغيل X_news\n"
-            f"🕒 {now_ksa_str()}\n"
-            "════════════════════\n"
-            f"✅ Checked: {checked}\n"
-            f"📤 Sent: {sent}\n"
-            "════════════════════\n"
-            + "\n".join(lines[:12]),
-            preview=False
-        )
+    telegram_send(
+        f"""🧪 ملخص تشغيل X_news
+🕒 {now_ksa()}
+════════════════════
+Checked: {len(ACCOUNTS)}
+Sent: {sent}
+════════════════════"""
+    )
 
 
 if __name__ == "__main__":
