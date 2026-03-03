@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote_plus
 
 import requests
 import feedparser
@@ -22,10 +23,10 @@ ACCOUNTS = [
     "KSAMOFA",
 ]
 
-# If you set a specific instance in secret RSSHUB_BASE, it will be tried FIRST.
+# Preferred RSSHub instance (optional secret). If empty, we'll still try fallbacks.
 PREFERRED_RSSHUB = (os.getenv("RSSHUB_BASE") or "").strip().rstrip("/")
 
-# Fallback instances (we will try in order)
+# Try multiple RSSHub instances (some get blocked)
 RSSHUB_INSTANCES = [
     PREFERRED_RSSHUB,
     "https://rsshub.app",
@@ -34,7 +35,7 @@ RSSHUB_INSTANCES = [
     "https://rsshub.liumingye.cn",
 ]
 
-# remove empties + duplicates (keep order)
+# remove empties + duplicates, keep order
 _seen = set()
 RSSHUB_INSTANCES = [x for x in RSSHUB_INSTANCES if x and (x not in _seen and not _seen.add(x))]
 
@@ -48,7 +49,9 @@ MAX_ITEMS_PER_ACCOUNT = 3
 SEND_NO_NEW_SUMMARY = False  # True = يرسل "لا يوجد جديد"
 REQUEST_TIMEOUT = 35
 
-UA = "Mozilla/5.0 (compatible; X_news/1.0; +https://github.com/)"
+UA = "Mozilla/5.0 (compatible; X_news/2.0; +https://github.com/)"
+X_URL_RE = re.compile(r"https?://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/\d+")
+
 
 def now_ksa_str() -> str:
     dt = datetime.now(tz=KSA_TZ)
@@ -98,14 +101,23 @@ def is_probably_xml(text: str) -> bool:
     head = text.lstrip()[:300].lower()
     if "<html" in head or "<!doctype html" in head:
         return False
-    # RSS/Atom usually contains these markers
     return ("<?xml" in head) or ("<rss" in head) or ("<feed" in head)
 
 
-def fetch_feed_with_fallback(username: str):
+def extract_x_link(*chunks: str) -> str:
+    for c in chunks:
+        if not c:
+            continue
+        m = X_URL_RE.search(c)
+        if m:
+            return m.group(0)
+    return ""
+
+
+def fetch_rsshub_feed(username: str):
     """
     Tries multiple RSSHub instances.
-    Returns: (feed, used_url, error_str_or_none)
+    Returns: (feed, used_url, err_or_none)
     """
     last_err = None
     route = f"/twitter/user/{username}"
@@ -121,15 +133,13 @@ def fetch_feed_with_fallback(username: str):
                 },
                 timeout=REQUEST_TIMEOUT,
             )
-            # some instances return 200 but with HTML error page
-            content = (r.text or "").strip()
 
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
                 continue
 
+            content = (r.text or "").strip()
             if not is_probably_xml(content):
-                # keep a short hint
                 hint = content.lstrip()[:120].replace("\n", " ")
                 last_err = f"Non-XML response (likely blocked/HTML). Hint: {hint}"
                 continue
@@ -146,16 +156,45 @@ def fetch_feed_with_fallback(username: str):
             last_err = str(e)[:180]
             continue
 
-    return None, f"{RSSHUB_INSTANCES[0]}{route}" if RSSHUB_INSTANCES else route, last_err or "Unknown error"
+    # If we got here, RSSHub failed
+    first_url = f"{RSSHUB_INSTANCES[0]}{route}" if RSSHUB_INSTANCES else route
+    return None, first_url, last_err or "Unknown error"
 
 
-def build_message(username: str, text: str, link: str) -> str:
+def google_news_feed_url_for_user(username: str) -> str:
+    # Google News RSS search (Arabic/Saudi)
+    # We search for tweets from that account; then we extract x.com/status from the RSS item content.
+    q = f'site:x.com "{username}" (status OR /status/)'
+    return (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(q)
+        + "&hl=ar&gl=SA&ceid=SA:ar"
+    )
+
+
+def fetch_google_news_feed(username: str):
+    url = google_news_feed_url_for_user(username)
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            return None, url, f"HTTP {r.status_code}"
+        feed = feedparser.parse(r.text)
+        if getattr(feed, "bozo", False):
+            err = getattr(feed, "bozo_exception", None)
+            return None, url, f"Parse error: {str(err)[:160] if err else 'Unknown'}"
+        return feed, url, None
+    except Exception as e:
+        return None, url, str(e)[:180]
+
+
+def build_message(username: str, text: str, link: str, source_tag: str) -> str:
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
         f"🕒 {now_ksa_str()}\n"
         "════════════════════\n"
-        f"📌 الحساب: @{username}\n\n"
-        "📝 التغريدة:\n"
+        f"📌 الحساب: @{username}\n"
+        f"🧩 المصدر: {source_tag}\n\n"
+        "📝 التغريدة/المحتوى:\n"
         f"{text}\n\n"
         "🔗 رابط التغريدة:\n"
         f"{link}\n"
@@ -163,20 +202,28 @@ def build_message(username: str, text: str, link: str) -> str:
     )
 
 
-def build_error_message(username: str, tried_first_url: str, err: str) -> str:
-    instances_text = "\n".join([f"• {x}" for x in RSSHUB_INSTANCES[:4]])  # لا نطوّل
+def build_error_message(username: str, where: str, err: str) -> str:
     return (
-        "⚠️ رصد منصة X (RSS) — تعذر قراءة التغريدات\n"
+        "⚠️ رصد منصة X — تعذر قراءة التغريدات\n"
         f"🕒 {now_ksa_str()}\n"
         "════════════════════\n"
         f"📌 الحساب: @{username}\n"
-        f"🔗 المصدر (المحاولة الأولى): {tried_first_url}\n"
+        f"🔗 المصدر: {where}\n"
         f"🧾 السبب: {err}\n"
-        "════════════════════\n"
-        "🛠️ Instances (Fallback):\n"
-        f"{instances_text}\n"
         "════════════════════"
     )
+
+
+def entries_new_since(entries, last_seen, limit):
+    new_entries = []
+    for e in entries[: limit * 8]:
+        eid = getattr(e, "id", None) or getattr(e, "link", None)
+        if not eid:
+            continue
+        if last_seen and eid == last_seen:
+            break
+        new_entries.append(e)
+    return list(reversed(new_entries))[:limit]
 
 
 def main():
@@ -186,39 +233,44 @@ def main():
     for username in ACCOUNTS:
         last_seen = state.get(username)
 
-        feed, used_url, err = fetch_feed_with_fallback(username)
+        # 1) Try RSSHub first
+        feed, used_url, err = fetch_rsshub_feed(username)
 
+        source_tag = "RSSHub"
         if err or feed is None:
-            telegram_send(build_error_message(username, used_url, err or "Unknown"))
-            time.sleep(1.0)
-            continue
+            # 2) Fallback to Google News RSS
+            feed, used_url_g, err_g = fetch_google_news_feed(username)
+            source_tag = "Google News RSS (Fallback)"
+            if err_g or feed is None:
+                # If both failed
+                telegram_send(build_error_message(username, used_url, f"RSSHub failed: {err} | Google failed: {err_g}"))
+                time.sleep(1.0)
+                continue
+            used_url = used_url_g  # for state context if needed
 
         entries = list(getattr(feed, "entries", []) or [])
-
-        new_entries = []
-        for e in entries[: MAX_ITEMS_PER_ACCOUNT * 6]:
-            eid = getattr(e, "id", None) or getattr(e, "link", None)
-            if not eid:
-                continue
-            if last_seen and eid == last_seen:
-                break
-            new_entries.append(e)
-
-        new_entries = list(reversed(new_entries))[:MAX_ITEMS_PER_ACCOUNT]
+        new_entries = entries_new_since(entries, last_seen, MAX_ITEMS_PER_ACCOUNT)
 
         for e in new_entries:
             link = (getattr(e, "link", "") or "").strip()
             title = clean_text(getattr(e, "title", "") or "")
             summary = clean_text(getattr(e, "summary", "") or "")
 
+            # Try to extract the real x.com tweet link (especially for Google News RSS)
+            x_link = extract_x_link(link, title, summary)
+
+            # If we couldn't extract x.com link, we still send the available link
+            final_link = x_link if x_link else link
+
             text = title if len(title) >= 10 else summary
             if not text:
-                text = "(لم يظهر نص واضح من مصدر RSS)"
+                text = "(لم يظهر نص واضح من المصدر)"
 
-            telegram_send(build_message(username, text, link))
+            telegram_send(build_message(username, text, final_link, source_tag))
             sent_any = True
             time.sleep(1.2)
 
+        # Update state with newest entry
         if entries:
             newest = entries[0]
             newest_id = getattr(newest, "id", None) or getattr(newest, "link", None)
@@ -232,7 +284,7 @@ def main():
             "✅ رصد منصة X — حسابات محددة\n"
             f"🕒 {now_ksa_str()}\n"
             "════════════════════\n"
-            "لا توجد تغريدات جديدة منذ آخر فحص.\n"
+            "لا توجد تحديثات جديدة منذ آخر فحص.\n"
             "════════════════════"
         )
 
