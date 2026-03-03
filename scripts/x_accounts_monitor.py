@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urljoin
 
 import requests
 import feedparser
@@ -30,30 +31,34 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 24  # بعد ما يشتغل رجعها 3 لو تبي
 
-# ✅ Debug دائم: يرسل تقرير واحد كل تشغيل
+# بعد ما تتأكد أنه صار يرسل، رجعها 3
+MAX_AGE_HOURS = 24
+
+# Debug summary per run
 DEBUG_ALWAYS = True
 
-UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/DEBUG)"
-X_STATUS_RE = re.compile(r"https?://(?:x\.com|twitter\.com|xcancel\.com|twitt\.re|nitter\.[^/]+)/([A-Za-z0-9_]+)/status/(\d+)")
-
-# =========================
-# RSS FRONTENDS (ROTATION)
-# =========================
+# RSS frontends (we mostly rely on xcancel since it responds 200 for you)
 FEED_SOURCES = [
     {"name": "xcancel.com (mistique UA)", "base": "https://xcancel.com", "ua": "mistique", "path": "/{user}/rss"},
     {"name": "xcancel.com (browser UA)", "base": "https://xcancel.com", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
-    {"name": "twitt.re", "base": "https://twitt.re", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
-    {"name": "nitter.privacydev.net", "base": "https://nitter.privacydev.net", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
-    {"name": "nitter.poast.org", "base": "https://nitter.poast.org", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
 ]
+
+UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/8.0)"
+
+
+# Accept many status URL forms (with or without username)
+STATUS_ID_RE = re.compile(r"/status/(\d+)")
+IWEB_STATUS_ID_RE = re.compile(r"/i/web/status/(\d+)")
+
 
 def now_ksa() -> datetime:
     return datetime.now(tz=KSA_TZ)
 
+
 def now_ksa_str() -> str:
     return now_ksa().strftime("%Y-%m-%d | %H:%M") + " KSA"
+
 
 def load_state() -> dict:
     if STATE_PATH.exists():
@@ -63,8 +68,10 @@ def load_state() -> dict:
             return {}
     return {}
 
+
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def clean_text(s: str) -> str:
     if not s:
@@ -75,6 +82,7 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+
 def telegram_send(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secrets.")
@@ -82,6 +90,7 @@ def telegram_send(message: str) -> None:
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True}
     r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
+
 
 def entry_time_ksa(entry) -> datetime | None:
     dt_utc = None
@@ -93,20 +102,14 @@ def entry_time_ksa(entry) -> datetime | None:
         return None
     return dt_utc.astimezone(KSA_TZ)
 
+
 def is_recent(entry) -> bool:
     t = entry_time_ksa(entry)
     if not t:
+        # بعض RSS ما يعطي وقت، نسمح مؤقتًا
         return True
     return t >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
 
-def normalize_to_x(link: str) -> str:
-    if not link:
-        return link
-    link = link.replace("twitter.com", "x.com")
-    link = re.sub(r"https?://xcancel\.com/", "https://x.com/", link)
-    link = re.sub(r"https?://twitt\.re/", "https://x.com/", link)
-    link = re.sub(r"https?://nitter\.[^/]+/", "https://x.com/", link)
-    return link
 
 def looks_like_rss(text: str) -> bool:
     if not text:
@@ -116,27 +119,36 @@ def looks_like_rss(text: str) -> bool:
         return False
     return ("<rss" in head) or ("<feed" in head) or ("<?xml" in head)
 
+
 def sanitize_xml(text: str) -> str:
-    """
-    ✅ Fix: remove BOM/whitespace/garbage before the first '<'
-    to avoid: 'XML declaration not at start of entity'
-    """
+    # remove BOM + anything before first '<'
     if not text:
         return ""
-    # remove BOM
     text = text.replace("\ufeff", "")
-    # strip leading whitespace/newlines
     text = text.lstrip(" \t\r\n")
-    # if there is any garbage before first '<', cut it
     idx = text.find("<")
     if idx > 0:
         text = text[idx:]
     return text
 
+
+def extract_status_id(link: str) -> str:
+    if not link:
+        return ""
+    m = STATUS_ID_RE.search(link)
+    if m:
+        return m.group(1)
+    m = IWEB_STATUS_ID_RE.search(link)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def to_x_link(username: str, status_id: str) -> str:
+    return f"https://x.com/{username}/status/{status_id}"
+
+
 def fetch_user_rss(username: str, debug_lines: list[str]):
-    """
-    Returns (feed, used_source_name, used_url) or (None, "", "")
-    """
     for src in FEED_SOURCES:
         base = src["base"].rstrip("/")
         ua = (src.get("ua") or UA_FALLBACK).strip()
@@ -157,21 +169,15 @@ def fetch_user_rss(username: str, debug_lines: list[str]):
 
             ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
             body_raw = r.text or ""
-            rss_flag = "RSS" if looks_like_rss(body_raw) else "HTML/OTHER"
-            debug_lines.append(f"  - {src['name']}: HTTP {r.status_code} | {ctype or 'no-ctype'} | {rss_flag} | len={len(body_raw)}")
+            debug_lines.append(f"  - {src['name']}: HTTP {r.status_code} | {ctype or 'no-ctype'} | len={len(body_raw)}")
 
             if r.status_code != 200:
                 continue
-
             if not looks_like_rss(body_raw):
+                debug_lines.append("    ↳ not RSS (looks like HTML/other)")
                 continue
 
             body = sanitize_xml(body_raw)
-            if len(body) < 300:
-                debug_lines.append("    ↳ sanitized body too short")
-                continue
-
-            # parse sanitized XML
             feed = feedparser.parse(body)
             if getattr(feed, "bozo", False):
                 err = getattr(feed, "bozo_exception", None)
@@ -186,7 +192,8 @@ def fetch_user_rss(username: str, debug_lines: list[str]):
 
     return None, "", ""
 
-def build_tweet_msg(username: str, text: str, link: str, src_name: str, entry_dt: datetime | None) -> str:
+
+def build_tweet_msg(username: str, text: str, x_link: str, src_name: str, entry_dt: datetime | None) -> str:
     time_line = entry_dt.strftime("%Y-%m-%d | %H:%M") + " KSA" if entry_dt else now_ksa_str()
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
@@ -196,10 +203,11 @@ def build_tweet_msg(username: str, text: str, link: str, src_name: str, entry_dt
         f"🧩 المصدر: {src_name}\n\n"
         "📝 التغريدة:\n"
         f"{text}\n\n"
-        "🔗 الرابط:\n"
-        f"{link}\n"
+        "🔗 رابط التغريدة:\n"
+        f"{x_link}\n"
         "════════════════════"
     )
+
 
 def main():
     state = load_state()
@@ -217,29 +225,39 @@ def main():
 
         entries = list(getattr(feed, "entries", []) or [])
         debug.append(f"  => RESULT: ✅ {src_name} | entries={len(entries)}")
-        last_seen = state.get(username)
 
+        last_seen = state.get(username)
         newest_id = None
-        to_send = []
+        candidates = []
         scanned = 0
 
-        for e in entries[: 60]:
+        for e in entries[: 80]:
             scanned += 1
             eid = getattr(e, "id", None) or getattr(e, "link", None)
             if not eid:
                 continue
+
             if newest_id is None:
                 newest_id = eid
+
+            # stop at duplicate barrier
             if last_seen and eid == last_seen:
                 break
 
-            link = (getattr(e, "link", "") or "").strip()
-            m = X_STATUS_RE.search(link)
-            if not m or m.group(1).lower() != username.lower():
-                continue
-
             if not is_recent(e):
                 continue
+
+            link = (getattr(e, "link", "") or "").strip()
+            # make absolute if it is relative
+            if link.startswith("/"):
+                link = urljoin("https://xcancel.com", link)
+
+            status_id = extract_status_id(link)
+            if not status_id:
+                continue
+
+            # ✅ Build clean official x.com link for THIS account timeline
+            x_link = to_x_link(username, status_id)
 
             title = clean_text(getattr(e, "title", "") or "")
             summary = clean_text(getattr(e, "summary", "") or "")
@@ -247,18 +265,20 @@ def main():
             if not text:
                 text = "(بدون نص واضح)"
 
-            to_send.append((e, text, normalize_to_x(link)))
+            candidates.append((e, text, x_link))
 
-            if len(to_send) >= MAX_ITEMS_PER_ACCOUNT:
+            if len(candidates) >= MAX_ITEMS_PER_ACCOUNT:
                 break
 
-        debug.append(f"  scanned={scanned} candidates={len(to_send)}")
+        debug.append(f"  scanned={scanned} candidates={len(candidates)}")
 
-        for e, text, link in reversed(to_send):
-            telegram_send(build_tweet_msg(username, text, link, src_name, entry_time_ksa(e)))
+        # send oldest -> newest
+        for e, text, x_link in reversed(candidates):
+            telegram_send(build_tweet_msg(username, text, x_link, src_name, entry_time_ksa(e)))
             sent_total += 1
             time.sleep(1.0)
 
+        # update state
         if newest_id:
             state[username] = newest_id
 
@@ -269,6 +289,7 @@ def main():
 
     if DEBUG_ALWAYS:
         telegram_send("\n".join(debug))
+
 
 if __name__ == "__main__":
     main()
