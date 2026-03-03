@@ -1,7 +1,7 @@
 import os
 import json
 import time
-import html
+import html as htmlmod
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -12,7 +12,7 @@ import requests
 import feedparser
 
 # =========================
-# ACCOUNTS
+# CONFIG
 # =========================
 ACCOUNTS = [
     "SaudiNews50",
@@ -31,20 +31,18 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 24   # بعد ما يشتغل رجعها 3
+
+# بعد ما تتأكد أنه يرسل، رجعها 3
+MAX_AGE_HOURS = 24
+
 DEBUG_ALWAYS = True
 
-FEED_SOURCES = [
-    {"name": "xcancel.com (mistique UA)", "base": "https://xcancel.com", "ua": "mistique", "path": "/{user}/rss"},
-    {"name": "xcancel.com (browser UA)", "base": "https://xcancel.com", "ua": "Mozilla/5.0", "path": "/{user}/rss"},
-]
+# xcancel source
+XCANCEL_BASE = "https://xcancel.com"
+XCANCEL_UA = "mistique"  # مهم
 
-UA_FALLBACK = "Mozilla/5.0 (compatible; X_news/9.0)"
-
-# Match many forms:
-# /status/123..., /i/web/status/123..., twitter/x links in HTML
-STATUS_ID_RE = re.compile(r"(?:/status/|/i/web/status/)(\d{8,25})")
-PLAIN_ID_RE = re.compile(r"\b(\d{12,25})\b")  # fallback: long numeric id in text
+# Regex to extract tweet IDs from HTML
+STATUS_ID_RE = re.compile(r"/status/(\d{8,25})")
 
 
 def now_ksa() -> datetime:
@@ -71,7 +69,7 @@ def save_state(state: dict) -> None:
 def clean_text(s: str) -> str:
     if not s:
         return ""
-    s = html.unescape(s)
+    s = htmlmod.unescape(s)
     s = re.sub(r"<[^>]+>", "", s)
     s = re.sub(r"\s+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
@@ -98,20 +96,10 @@ def entry_time_ksa(entry) -> datetime | None:
     return dt_utc.astimezone(KSA_TZ)
 
 
-def is_recent(entry) -> bool:
-    t = entry_time_ksa(entry)
-    if not t:
+def is_recent_dt(dt: datetime | None) -> bool:
+    if not dt:
         return True
-    return t >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
-
-
-def looks_like_rss(text: str) -> bool:
-    if not text:
-        return False
-    head = text.lstrip()[:300].lower()
-    if "<html" in head or "<!doctype html" in head:
-        return False
-    return ("<rss" in head) or ("<feed" in head) or ("<?xml" in head)
+    return dt >= (now_ksa() - timedelta(hours=MAX_AGE_HOURS))
 
 
 def sanitize_xml(text: str) -> str:
@@ -129,115 +117,76 @@ def to_x_link(username: str, status_id: str) -> str:
     return f"https://x.com/{username}/status/{status_id}"
 
 
-def _as_str(x) -> str:
-    if x is None:
-        return ""
+def fetch_xcancel_rss(username: str):
+    """
+    Try RSS first (may be broken/empty on GH actions).
+    Return (entries, debug_note)
+    """
+    url = f"{XCANCEL_BASE}/{username}/rss"
     try:
-        return str(x)
-    except Exception:
-        return ""
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": XCANCEL_UA,
+                "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+                "Referer": XCANCEL_BASE + "/",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return [], f"RSS HTTP {r.status_code}"
+        feed = feedparser.parse(sanitize_xml(r.text or ""))
+        if getattr(feed, "bozo", False):
+            err = getattr(feed, "bozo_exception", None)
+            return [], f"RSS parse error: {str(err)[:120] if err else 'Unknown'}"
+        return list(getattr(feed, "entries", []) or []), f"RSS ok entries={len(getattr(feed, 'entries', []) or [])}"
+    except Exception as e:
+        return [], f"RSS exception: {str(e)[:120]}"
 
 
-def extract_status_id_from_entry(entry) -> str:
+def fetch_xcancel_html_status_ids(username: str, limit: int):
     """
-    Search status id in:
-    link, id, guid, title, summary, summary_detail, links[]
+    Scrape xcancel HTML page and extract /status/<id>
+    Return list of unique IDs (newest first usually).
     """
-    candidates = []
+    url = f"{XCANCEL_BASE}/{username}"
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": XCANCEL_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": XCANCEL_BASE + "/",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.status_code != 200:
+        return [], f"HTML HTTP {r.status_code}"
 
-    candidates.append(_as_str(getattr(entry, "link", "")))
-    candidates.append(_as_str(getattr(entry, "id", "")))
-    candidates.append(_as_str(getattr(entry, "guid", "")))
-    candidates.append(_as_str(getattr(entry, "title", "")))
-    candidates.append(_as_str(getattr(entry, "summary", "")))
+    body = r.text or ""
+    ids = STATUS_ID_RE.findall(body)
 
-    sd = getattr(entry, "summary_detail", None)
-    if sd and isinstance(sd, dict):
-        candidates.append(_as_str(sd.get("value", "")))
-
-    links = getattr(entry, "links", None)
-    if links and isinstance(links, list):
-        for lk in links[:5]:
-            if isinstance(lk, dict):
-                candidates.append(_as_str(lk.get("href", "")))
-            else:
-                candidates.append(_as_str(lk))
-
-    # Normalize relative URLs (some feeds use /i/web/status/..)
-    normalized = []
-    for c in candidates:
-        c = c.strip()
-        if c.startswith("/"):
-            c = urljoin("https://xcancel.com", c)
-        normalized.append(c)
-
-    # 1) Try explicit /status/ or /i/web/status/
-    blob = " | ".join(normalized)
-    m = STATUS_ID_RE.search(blob)
-    if m:
-        return m.group(1)
-
-    # 2) Fallback: look for long numeric id
-    m2 = PLAIN_ID_RE.search(blob)
-    if m2:
-        return m2.group(1)
-
-    return ""
-
-
-def fetch_user_rss(username: str, debug_lines: list[str]):
-    for src in FEED_SOURCES:
-        base = src["base"].rstrip("/")
-        ua = (src.get("ua") or UA_FALLBACK).strip()
-        path = (src.get("path") or "/{user}/rss").format(user=username)
-        url = f"{base}{path}"
-
-        try:
-            r = requests.get(
-                url,
-                headers={
-                    "User-Agent": ua,
-                    "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-                    "Accept-Language": "ar,en;q=0.8",
-                    "Referer": base + "/",
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
-            body_raw = r.text or ""
-            debug_lines.append(f"  - {src['name']}: HTTP {r.status_code} | {ctype or 'no-ctype'} | len={len(body_raw)}")
-
-            if r.status_code != 200:
-                continue
-            if not looks_like_rss(body_raw):
-                debug_lines.append("    ↳ not RSS (looks like HTML/other)")
-                continue
-
-            body = sanitize_xml(body_raw)
-            feed = feedparser.parse(body)
-            if getattr(feed, "bozo", False):
-                err = getattr(feed, "bozo_exception", None)
-                debug_lines.append(f"    ↳ parse bozo: {str(err)[:120] if err else 'Unknown'}")
-                continue
-
-            return feed, src["name"], url
-
-        except Exception as e:
-            debug_lines.append(f"  - {src['name']}: EXC {str(e)[:120]}")
+    # dedupe keep order
+    seen = set()
+    uniq = []
+    for sid in ids:
+        if sid in seen:
             continue
+        seen.add(sid)
+        uniq.append(sid)
+        if len(uniq) >= limit * 6:
+            break
 
-    return None, "", ""
+    return uniq[: limit * 3], f"HTML ok ids={len(uniq)}"
 
 
-def build_tweet_msg(username: str, text: str, x_link: str, src_name: str, entry_dt: datetime | None) -> str:
-    time_line = entry_dt.strftime("%Y-%m-%d | %H:%M") + " KSA" if entry_dt else now_ksa_str()
+def build_msg(username: str, text: str, x_link: str, source: str, dt: datetime | None) -> str:
+    time_line = dt.strftime("%Y-%m-%d | %H:%M") + " KSA" if dt else now_ksa_str()
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
         f"🕒 {time_line}\n"
         "════════════════════\n"
         f"📌 الحساب: @{username}\n"
-        f"🧩 المصدر: {src_name}\n\n"
+        f"🧩 المصدر: {source}\n\n"
         "📝 التغريدة:\n"
         f"{text}\n\n"
         "🔗 رابط التغريدة:\n"
@@ -253,65 +202,64 @@ def main():
     debug = [f"🧪 Debug X_news — {now_ksa_str()}", "════════════════════"]
 
     for username in ACCOUNTS:
-        debug.append(f"@{username}:")
-        feed, src_name, used_url = fetch_user_rss(username, debug)
+        last_seen = state.get(username)
 
-        if not feed:
-            debug.append("  => RESULT: ❌ no working RSS source")
+        # 1) Try RSS (mostly for title/summary if it ever works)
+        rss_entries, rss_note = fetch_xcancel_rss(username)
+        debug.append(f"@{username}: {rss_note}")
+
+        # 2) Always scrape HTML for status IDs (this is the reliable part)
+        ids, html_note = fetch_xcancel_html_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
+        debug.append(f"  - {html_note}")
+
+        if not ids:
+            debug.append("  => RESULT: ❌ no status ids")
             continue
 
-        entries = list(getattr(feed, "entries", []) or [])
-        debug.append(f"  => RESULT: ✅ {src_name} | entries={len(entries)}")
+        # Use first ID as state barrier (newest)
+        newest_id = ids[0]
 
-        last_seen = state.get(username)
-        newest_id = None
-        candidates = []
-        scanned = 0
-
-        for e in entries[: 80]:
-            scanned += 1
-            eid = getattr(e, "id", None) or getattr(e, "link", None)
-            if not eid:
-                continue
-            if newest_id is None:
-                newest_id = eid
-            if last_seen and eid == last_seen:
+        # Build list of new IDs until last_seen
+        new_ids = []
+        for sid in ids:
+            if last_seen and sid == last_seen:
                 break
+            new_ids.append(sid)
 
-            if not is_recent(e):
+        # Send oldest -> newest, limit
+        new_ids = list(reversed(new_ids))[:MAX_ITEMS_PER_ACCOUNT]
+
+        # Try to map titles from RSS if possible (best-effort)
+        # We'll create a dict status_id->text if RSS contains status links.
+        rss_text_by_id = {}
+        for e in rss_entries[:30]:
+            link = (getattr(e, "link", "") or "").strip()
+            if link.startswith("/"):
+                link = urljoin(XCANCEL_BASE, link)
+            m = STATUS_ID_RE.search(link)
+            if not m:
+                # sometimes in id field
+                eid = str(getattr(e, "id", "") or "")
+                m = STATUS_ID_RE.search(eid)
+            if not m:
                 continue
-
-            status_id = extract_status_id_from_entry(e)
-            if not status_id:
-                # Debug a tiny peek (only once per account)
-                if scanned == 1:
-                    lk = _as_str(getattr(e, "link", ""))[:120].replace("\n", " ")
-                    ei = _as_str(getattr(e, "id", ""))[:120].replace("\n", " ")
-                    sm = _as_str(getattr(e, "summary", ""))[:120].replace("\n", " ")
-                    debug.append(f"  ↳ no status_id. link='{lk}' id='{ei}' summary='{sm}'")
-                continue
-
-            x_link = to_x_link(username, status_id)
-
+            sid = m.group(1)
             title = clean_text(getattr(e, "title", "") or "")
             summary = clean_text(getattr(e, "summary", "") or "")
             text = title if len(title) >= 5 else summary
-            if not text:
-                text = "(بدون نص واضح)"
+            if text:
+                rss_text_by_id[sid] = text
 
-            candidates.append((e, text, x_link))
-            if len(candidates) >= MAX_ITEMS_PER_ACCOUNT:
-                break
-
-        debug.append(f"  scanned={scanned} candidates={len(candidates)}")
-
-        for e, text, x_link in reversed(candidates):
-            telegram_send(build_tweet_msg(username, text, x_link, src_name, entry_time_ksa(e)))
+        for sid in new_ids:
+            x_link = to_x_link(username, sid)
+            text = rss_text_by_id.get(sid, f"(تغريدة جديدة من @{username})")
+            telegram_send(build_msg(username, text, x_link, "xcancel HTML (Author-only)", None))
             sent_total += 1
             time.sleep(1.0)
 
-        if newest_id:
-            state[username] = newest_id
+        # Update state always to newest id (prevents repeats)
+        state[username] = newest_id
+        debug.append(f"  => RESULT: sent={len(new_ids)} newest_id={newest_id}")
 
     save_state(state)
 
