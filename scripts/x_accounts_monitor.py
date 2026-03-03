@@ -25,19 +25,17 @@ TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 STATE_PATH = Path("state_x_accounts.json")
+
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
 MAX_ITEMS_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 35
-MAX_AGE_HOURS = 3  # آخر 3 ساعات (إذا قدرنا نقرأ وقت التغريدة)
+MAX_AGE_HOURS = 3
 
-# ✅ لا ترسل رسائل أخطاء إلا إذا فشل كل شيء للحساب
-SEND_ERROR_ONLY_IF_ALL_FAIL = True
+# retry inside the same run
+PER_REQUEST_RETRIES = 2
+RETRY_SLEEP_SECONDS = 6
 
-# =========================
-# FRONTENDS (ROTATION)
-# =========================
-# ملاحظة: xcancel يحتاج UA=mistique غالبًا
 FRONTENDS = [
     {"name": "xcancel", "base": "https://xcancel.com", "ua": "mistique"},
     {"name": "xcancel-browser", "base": "https://xcancel.com", "ua": "Mozilla/5.0"},
@@ -47,12 +45,13 @@ FRONTENDS = [
 ]
 
 STATUS_ID_RE = re.compile(r"/status/(\d{8,25})")
+TIME_DT_RE = re.compile(r'datetime="([^"]+)"')
+
 TWEET_TEXT_PATTERNS = [
     re.compile(r'(?s)<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
     re.compile(r'(?s)<div[^>]+class="main-tweet"[^>]*>.*?<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
     re.compile(r'(?s)<div[^>]+class="tweet-body"[^>]*>.*?<div[^>]+class="tweet-content"[^>]*>(.*?)</div>'),
 ]
-TIME_DT_RE = re.compile(r'datetime="([^"]+)"')
 
 
 def now_ksa() -> datetime:
@@ -102,40 +101,44 @@ def to_x_link(username: str, status_id: str) -> str:
 
 def fetch_html(path: str):
     """
-    Try multiple frontends; return first working HTML.
-    Returns: (html_text, frontend_name)
+    Try multiple frontends with retry.
+    Returns: (html_text, frontend_name) or raises.
     """
-    errors = []
     for f in FRONTENDS:
         base = f["base"].rstrip("/")
         url = f"{base}{path}"
-        try:
-            r = requests.get(
-                url,
-                headers={
-                    "User-Agent": f["ua"],
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "ar,en;q=0.8",
-                    "Referer": base + "/",
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            if r.status_code != 200:
-                errors.append(f"{f['name']} HTTP {r.status_code}")
-                continue
 
-            body = r.text or ""
-            if len(body) < 200:
-                errors.append(f"{f['name']} empty/short")
-                continue
+        for attempt in range(PER_REQUEST_RETRIES + 1):
+            try:
+                r = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": f["ua"],
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "ar,en;q=0.8",
+                        "Referer": base + "/",
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
 
-            return body, f["name"], errors
+                if r.status_code == 200:
+                    body = r.text or ""
+                    if len(body) >= 200:
+                        return body, f["name"]
+                    break
 
-        except Exception as e:
-            errors.append(f"{f['name']} EXC {str(e)[:90]}")
-            continue
+                if r.status_code in (503, 429) and attempt < PER_REQUEST_RETRIES:
+                    time.sleep(RETRY_SLEEP_SECONDS)
+                    continue
+                break
 
-    raise RuntimeError(" | ".join(errors[:3]) if errors else "All frontends failed")
+            except Exception:
+                if attempt < PER_REQUEST_RETRIES:
+                    time.sleep(RETRY_SLEEP_SECONDS)
+                    continue
+                break
+
+    raise RuntimeError("All frontends failed")
 
 
 def parse_datetime_from_html(body: str) -> datetime | None:
@@ -172,7 +175,7 @@ def extract_tweet_text(body: str) -> str:
 
 
 def fetch_account_status_ids(username: str, limit: int):
-    body, src, errs = fetch_html(f"/{username}")
+    body, src = fetch_html(f"/{username}")
     ids = STATUS_ID_RE.findall(body)
 
     seen = set()
@@ -185,22 +188,21 @@ def fetch_account_status_ids(username: str, limit: int):
         if len(uniq) >= limit * 10:
             break
 
-    return uniq, src
+    return uniq
 
 
 def fetch_tweet_page(username: str, status_id: str):
-    body, src, errs = fetch_html(f"/{username}/status/{status_id}")
-    return body, src
+    body, src = fetch_html(f"/{username}/status/{status_id}")
+    return body
 
 
-def build_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime | None, src_name: str) -> str:
+def build_msg(username: str, tweet_text: str, x_link: str, tweet_time: datetime | None) -> str:
     time_line = tweet_time.strftime("%Y-%m-%d | %H:%M") + " KSA" if tweet_time else now_ksa_str()
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
         f"🕒 {time_line}\n"
         "════════════════════\n"
-        f"📌 الحساب: @{username}\n"
-        f"🧩 المصدر: {src_name}\n\n"
+        f"📌 الحساب: @{username}\n\n"
         "📝 التغريدة:\n"
         f"{tweet_text}\n\n"
         "🔗 رابط التغريدة:\n"
@@ -216,9 +218,8 @@ def main():
         try:
             last_seen = state.get(username)
 
-            ids, account_src = fetch_account_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
+            ids = fetch_account_status_ids(username, MAX_ITEMS_PER_ACCOUNT)
             if not ids:
-                # لا شيء ظاهر
                 continue
 
             newest_id = ids[0]
@@ -232,37 +233,20 @@ def main():
             new_ids = list(reversed(new_ids))[:MAX_ITEMS_PER_ACCOUNT]
 
             for sid in new_ids:
-                x_link = to_x_link(username, sid)
-
-                tweet_html, tweet_src = fetch_tweet_page(username, sid)
+                tweet_html = fetch_tweet_page(username, sid)
                 tweet_time = parse_datetime_from_html(tweet_html)
 
                 if tweet_time and not is_recent(tweet_time):
                     continue
 
-                tweet_text = extract_tweet_text(tweet_html)
-                if not tweet_text:
-                    tweet_text = f"(تغريدة جديدة من @{username})"
-
-                telegram_send(build_msg(username, tweet_text, x_link, tweet_time, f"{tweet_src} (author-only)"))
+                tweet_text = extract_tweet_text(tweet_html) or f"(تغريدة جديدة من @{username})"
+                telegram_send(build_msg(username, tweet_text, to_x_link(username, sid), tweet_time))
                 time.sleep(1.2)
 
             state[username] = newest_id
 
-        except Exception as e:
-            # ✅ لا ترسل خطأ إلا إذا تبغى
-            if SEND_ERROR_ONLY_IF_ALL_FAIL:
-                try:
-                    telegram_send(
-                        "⚠️ رصد منصة X — تعذر الرصد لحساب\n"
-                        f"🕒 {now_ksa_str()}\n"
-                        "════════════════════\n"
-                        f"📌 الحساب: @{username}\n"
-                        f"🧾 السبب: {str(e)[:180]}\n"
-                        "════════════════════"
-                    )
-                except Exception:
-                    pass
+        except Exception:
+            # ✅ Silent: لا ترسل أخطاء ولا توقف
             continue
 
     save_state(state)
