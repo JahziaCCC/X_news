@@ -1,16 +1,12 @@
-name: X_news (RSS Monitor)
+name: X_news
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"  # كل 15 دقيقة
 
 permissions:
   contents: write
-
-concurrency:
-  group: x-news-monitor
-  cancel-in-progress: true
 
 jobs:
   run:
@@ -19,29 +15,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests feedparser
+          pip install requests
 
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # اختياري: لو حطّيت RSSHUB_BASE كسِرّ، بيستخدمه أول محاولة
-          RSSHUB_BASE: ${{ secrets.RSSHUB_BASE }}
         run: |
           python scripts/x_accounts_monitor.py
 
-      - name: Commit state
+      - name: Commit state files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # أضف ملفات الحالة لو تغيرت
           git add state_x_accounts.json || true
-          git commit -m "Update X_news state" || echo "No changes"
-          git push || true
+
+          # إذا ما فيه تغييرات لا تسوي شيء
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Update X_news state"
+          git push
