@@ -3,7 +3,7 @@ name: X_news
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # كل 15 دقيقة
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: write
@@ -39,7 +39,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add state_x_accounts.json || true
-
           git diff --cached --quiet && exit 0
 
           git commit -m "Update X_news state"
