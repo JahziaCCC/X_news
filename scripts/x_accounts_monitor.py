@@ -1,14 +1,18 @@
 import os
+import re
 import json
 import time
-import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote_plus
 
 import requests
 import feedparser
 
+# =========================
+# CONFIG
+# =========================
 ACCOUNTS = [
     "SaudiNews50",
     "alekhbariyatv",
@@ -25,23 +29,23 @@ TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
+LOOKBACK_HOURS = 3          # ✅ آخر 3 ساعات فقط
 MAX_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 25
 
-# RSSHub instances (rotate if one blocks/slow)
-RSSHUB_INSTANCES = [
-    "https://rsshub.app",
-    "https://rsshub.rssforever.com",
-    "https://rsshub.kenshinji.me",
-    "https://rsshub.liumingye.cn",
-]
+# Google News RSS locale (Saudi Arabic)
+GN_PARAMS = "hl=ar&gl=SA&ceid=SA:ar"
 
-# Extract status id from various url forms
-STATUS_ID_RE = re.compile(r"(?:/status/|/i/web/status/)(\d{8,25})")
+# Strict "tweet by account" URL pattern
+TWEET_URL_RE = re.compile(r"^https?://(x\.com|twitter\.com)/{acc}/status/\d+/?($|\?)", re.I)
+
+
+def now_ksa() -> datetime:
+    return datetime.now(tz=KSA_TZ)
 
 
 def now_ksa_str() -> str:
-    return datetime.now(tz=KSA_TZ).strftime("%Y-%m-%d | %H:%M") + " KSA"
+    return now_ksa().strftime("%Y-%m-%d | %H:%M") + " KSA"
 
 
 def telegram_send(text: str, preview: bool = False) -> None:
@@ -73,45 +77,58 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def extract_status_id(s: str) -> str:
-    if not s:
+def entry_time_ksa(entry) -> datetime | None:
+    # feedparser gives published_parsed in UTC struct_time
+    pp = getattr(entry, "published_parsed", None)
+    if not pp:
+        pp = getattr(entry, "updated_parsed", None)
+    if not pp:
+        return None
+    try:
+        dt_utc = datetime(pp.tm_year, pp.tm_mon, pp.tm_mday, pp.tm_hour, pp.tm_min, pp.tm_sec, tzinfo=ZoneInfo("UTC"))
+        return dt_utc.astimezone(KSA_TZ)
+    except Exception:
+        return None
+
+
+def is_recent(dt_ksa: datetime | None) -> bool:
+    if not dt_ksa:
+        return False  # إذا ما نعرف الوقت، لا نرسل (عشان ما يجيك قديم)
+    return dt_ksa >= (now_ksa() - timedelta(hours=LOOKBACK_HOURS))
+
+
+def resolve_final_url(google_news_url: str) -> str:
+    """
+    Google News RSS links are redirects.
+    We resolve to final URL so we can enforce x.com/<account>/status/<id>
+    """
+    try:
+        r = requests.get(
+            google_news_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+        return (r.url or "").strip()
+    except Exception:
         return ""
-    m = STATUS_ID_RE.search(s)
-    return m.group(1) if m else ""
 
 
-def fetch_feed(username: str):
-    last_err = None
-    for base in RSSHUB_INSTANCES:
-        url = f"{base}/twitter/user/{username}"
-        try:
-            # feedparser can fetch itself, but we do requests to control UA/timeouts
-            r = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (X_news RSSHub)"},
-                timeout=REQUEST_TIMEOUT,
-            )
-            if r.status_code != 200:
-                last_err = f"{base} HTTP {r.status_code}"
-                continue
-            feed = feedparser.parse(r.text)
-            if getattr(feed, "bozo", False):
-                last_err = f"{base} parse bozo"
-                continue
-            return feed, base
-        except Exception as e:
-            last_err = f"{base} EXC {str(e)[:80]}"
-            continue
-    raise RuntimeError(last_err or "All RSSHub instances failed")
+def build_google_news_rss_url(account: str) -> str:
+    # Search only tweets from this account (status URLs)
+    # This reduces replies/mentions massively.
+    q = f"site:x.com/{account}/status"
+    return f"https://news.google.com/rss/search?q={quote_plus(q)}&{GN_PARAMS}"
 
 
-def build_msg(username: str, text: str, x_link: str) -> str:
+def build_msg(account: str, text: str, x_link: str, dt_ksa: datetime, source_note: str) -> str:
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
-        f"🕒 {now_ksa_str()}\n"
+        f"🕒 {dt_ksa.strftime('%Y-%m-%d | %H:%M')} KSA\n"
         "════════════════════\n"
-        f"📌 الحساب: @{username}\n\n"
-        "📝 التغريدة:\n"
+        f"📌 الحساب: @{account}\n"
+        f"🧩 المصدر: Google News RSS (Fallback) — {source_note}\n\n"
+        "📝 التغريدة/المحتوى:\n"
         f"{text}\n\n"
         "🔗 رابط التغريدة:\n"
         f"{x_link}\n"
@@ -121,79 +138,79 @@ def build_msg(username: str, text: str, x_link: str) -> str:
 
 def main():
     state = load_state()
-    first_run = (state.get("_initialized") != True)
+    first_run = (state.get("_initialized") is not True)
 
     total_sent = 0
     lines = []
 
-    for username in ACCOUNTS:
+    for acc in ACCOUNTS:
+        sent_acc = 0
+        scanned = 0
+
         try:
-            feed, src = fetch_feed(username)
+            rss_url = build_google_news_rss_url(acc)
+            feed = feedparser.parse(rss_url)
             entries = list(getattr(feed, "entries", []) or [])
-            found = len(entries)
 
-            if found == 0:
-                lines.append(f"@{username}: found=0")
-                continue
+            # Sort by published time (newest first) if available
+            # (Google usually already returns newest first)
+            last_seen = state.get(acc)
 
-            # newest status id in feed
-            newest_id = extract_status_id(entries[0].get("link", "") or entries[0].get("id", ""))
-            if not newest_id:
-                # fallback: search any entry
-                for e in entries[:5]:
-                    newest_id = extract_status_id(e.get("link", "") or e.get("id", ""))
-                    if newest_id:
-                        break
+            for entry in entries[:30]:
+                scanned += 1
 
-            if not newest_id:
-                lines.append(f"@{username}: found={found} (no_status_id)")
-                continue
+                dt_ksa = entry_time_ksa(entry)
+                if not is_recent(dt_ksa):
+                    continue  # ✅ يمنع القديم
 
-            last_seen = state.get(username)
-
-            # ✅ First run: warm-up only (don’t spam old tweets)
-            if first_run and not last_seen:
-                state[username] = newest_id
-                lines.append(f"@{username}: found={found} warmup")
-                continue
-
-            # build list of new entries until last_seen
-            new_items = []
-            for e in entries[:50]:
-                sid = extract_status_id(e.get("link", "") or e.get("id", ""))
-                if not sid:
+                gn_link = (getattr(entry, "link", "") or "").strip()
+                if not gn_link:
                     continue
-                if last_seen and sid == last_seen:
+
+                # dedup key: google link
+                if last_seen and gn_link == last_seen:
                     break
-                new_items.append((sid, e))
 
-            # send oldest -> newest, limit
-            new_items = list(reversed(new_items))[:MAX_PER_ACCOUNT]
+                final_url = resolve_final_url(gn_link)
+                if not final_url:
+                    continue
 
-            sent = 0
-            for sid, e in new_items:
-                title = (e.get("title") or "").strip()
-                summary = (e.get("summary") or "").strip()
+                # ✅ لازم يكون tweet من نفس الحساب (مو رد/mention)
+                if not TWEET_URL_RE.pattern:
+                    pass
+                if not re.match(TWEET_URL_RE.pattern.format(acc=re.escape(acc)), final_url, flags=re.I):
+                    continue
 
-                # RSSHub often puts tweet text in title; pick a decent fallback
-                text = title if len(title) >= 5 else summary
-                text = re.sub(r"\s+", " ", text).strip()
-                if not text:
-                    text = f"(تغريدة جديدة من @{username})"
+                title = (getattr(entry, "title", "") or "").strip()
+                if not title:
+                    title = f"(تغريدة جديدة من @{acc})"
 
-                x_link = f"https://x.com/{username}/status/{sid}"
-                telegram_send(build_msg(username, text, x_link), preview=True)
-                sent += 1
+                telegram_send(build_msg(acc, title, final_url, dt_ksa, "x.com direct"), preview=True)
+                sent_acc += 1
                 total_sent += 1
                 time.sleep(0.8)
 
-            # update state to newest id always (after processing)
-            state[username] = newest_id
+                if sent_acc >= MAX_PER_ACCOUNT:
+                    break
 
-            lines.append(f"@{username}: found={found} new={len(new_items)} sent={sent}")
+            # Warmup: لا نرسل شيء أول مرة (لكن هنا نرسل فقط آخر 3 ساعات أصلاً، فآمن)
+            # ومع ذلك نخلي warmup على آخر عنصر لتثبيت نقطة البداية.
+            if first_run and entries:
+                # store newest link
+                newest_link = (getattr(entries[0], "link", "") or "").strip()
+                if newest_link:
+                    state[acc] = newest_link
+
+            # Normal: update state to newest link to avoid duplicates
+            if not first_run and entries:
+                newest_link = (getattr(entries[0], "link", "") or "").strip()
+                if newest_link:
+                    state[acc] = newest_link
+
+            lines.append(f"@{acc}: scanned={scanned} sent={sent_acc}")
 
         except Exception:
-            lines.append(f"@{username}: fail")
+            lines.append(f"@{acc}: fail")
 
     state["_initialized"] = True
     save_state(state)
