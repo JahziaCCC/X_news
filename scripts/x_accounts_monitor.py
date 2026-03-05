@@ -117,7 +117,7 @@ def resolve_final_url(google_news_url: str) -> str:
 
 def build_google_news_rss_url(account: str) -> str:
     # نبحث عن روابط status التابعة للحساب
-    q = f"site:x.com/{account}/status"
+    q = f"site:x.com/{account}"
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&{GN_PARAMS}"
 
 def keyword_match(text: str) -> bool:
