@@ -29,15 +29,29 @@ TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
-LOOKBACK_HOURS = 3          # ✅ آخر 3 ساعات فقط
+LOOKBACK_HOURS = 3          # آخر 3 ساعات فقط
 MAX_PER_ACCOUNT = 3
 REQUEST_TIMEOUT = 25
 
 # Google News RSS locale (Saudi Arabic)
 GN_PARAMS = "hl=ar&gl=SA&ceid=SA:ar"
 
+# كلمات مهمة (يرسل فقط إذا ظهرت)
+KEYWORDS = [
+    "بيان",
+    "عاجل",
+    "تحذير",
+    "تنويه",
+    "إعلان",
+    "alert",
+    "warning",
+    "emergency",
+]
+
 # Strict "tweet by account" URL pattern
-TWEET_URL_RE = re.compile(r"^https?://(x\.com|twitter\.com)/{acc}/status/\d+/?($|\?)", re.I)
+# must resolve to: https://x.com/<acc>/status/<id>
+def tweet_url_pattern(acc: str) -> re.Pattern:
+    return re.compile(rf"^https?://(x\.com|twitter\.com)/{re.escape(acc)}/status/\d+/?($|\?)", re.I)
 
 
 def now_ksa() -> datetime:
@@ -78,10 +92,7 @@ def save_state(state: dict) -> None:
 
 
 def entry_time_ksa(entry) -> datetime | None:
-    # feedparser gives published_parsed in UTC struct_time
-    pp = getattr(entry, "published_parsed", None)
-    if not pp:
-        pp = getattr(entry, "updated_parsed", None)
+    pp = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
     if not pp:
         return None
     try:
@@ -93,15 +104,11 @@ def entry_time_ksa(entry) -> datetime | None:
 
 def is_recent(dt_ksa: datetime | None) -> bool:
     if not dt_ksa:
-        return False  # إذا ما نعرف الوقت، لا نرسل (عشان ما يجيك قديم)
+        return False  # إذا ما نعرف الوقت -> تجاهل (عشان ما يجيك قديم)
     return dt_ksa >= (now_ksa() - timedelta(hours=LOOKBACK_HOURS))
 
 
 def resolve_final_url(google_news_url: str) -> str:
-    """
-    Google News RSS links are redirects.
-    We resolve to final URL so we can enforce x.com/<account>/status/<id>
-    """
     try:
         r = requests.get(
             google_news_url,
@@ -115,19 +122,23 @@ def resolve_final_url(google_news_url: str) -> str:
 
 
 def build_google_news_rss_url(account: str) -> str:
-    # Search only tweets from this account (status URLs)
-    # This reduces replies/mentions massively.
+    # Search only tweet status URLs for that account
     q = f"site:x.com/{account}/status"
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&{GN_PARAMS}"
 
 
-def build_msg(account: str, text: str, x_link: str, dt_ksa: datetime, source_note: str) -> str:
+def keyword_match(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k.lower() in t for k in KEYWORDS)
+
+
+def build_msg(account: str, text: str, x_link: str, dt_ksa: datetime) -> str:
     return (
         "🚨 رصد منصة X — حسابات محددة\n"
         f"🕒 {dt_ksa.strftime('%Y-%m-%d | %H:%M')} KSA\n"
         "════════════════════\n"
         f"📌 الحساب: @{account}\n"
-        f"🧩 المصدر: Google News RSS (Fallback) — {source_note}\n\n"
+        "🧩 المصدر: Google News RSS (Fallback)\n\n"
         "📝 التغريدة/المحتوى:\n"
         f"{text}\n\n"
         "🔗 رابط التغريدة:\n"
@@ -152,22 +163,30 @@ def main():
             feed = feedparser.parse(rss_url)
             entries = list(getattr(feed, "entries", []) or [])
 
-            # Sort by published time (newest first) if available
-            # (Google usually already returns newest first)
             last_seen = state.get(acc)
+            pat = tweet_url_pattern(acc)
+
+            # Warmup: نخزن نقطة البداية بدون إرسال (اختياري)
+            # لكن هنا لأننا نرسل فقط آخر 3 ساعات + كلمات مهمة، ما فيه سبام.
+            # مع ذلك نخلي warmup حتى ما يرسل لك أي شيء أول مرة.
+            if first_run and entries:
+                newest_link = (getattr(entries[0], "link", "") or "").strip()
+                if newest_link:
+                    state[acc] = newest_link
+                lines.append(f"@{acc}: warmup scanned={min(30, len(entries))} sent=0")
+                continue
 
             for entry in entries[:30]:
                 scanned += 1
 
                 dt_ksa = entry_time_ksa(entry)
                 if not is_recent(dt_ksa):
-                    continue  # ✅ يمنع القديم
+                    continue  # منع القديم
 
                 gn_link = (getattr(entry, "link", "") or "").strip()
                 if not gn_link:
                     continue
 
-                # dedup key: google link
                 if last_seen and gn_link == last_seen:
                     break
 
@@ -175,17 +194,19 @@ def main():
                 if not final_url:
                     continue
 
-                # ✅ لازم يكون tweet من نفس الحساب (مو رد/mention)
-                if not TWEET_URL_RE.pattern:
-                    pass
-                if not re.match(TWEET_URL_RE.pattern.format(acc=re.escape(acc)), final_url, flags=re.I):
+                # لازم يكون tweet من نفس الحساب
+                if not pat.match(final_url):
                     continue
 
                 title = (getattr(entry, "title", "") or "").strip()
                 if not title:
-                    title = f"(تغريدة جديدة من @{acc})"
+                    continue
 
-                telegram_send(build_msg(acc, title, final_url, dt_ksa, "x.com direct"), preview=True)
+                # فلتر الكلمات المهمة
+                if not keyword_match(title):
+                    continue
+
+                telegram_send(build_msg(acc, title, final_url, dt_ksa), preview=True)
                 sent_acc += 1
                 total_sent += 1
                 time.sleep(0.8)
@@ -193,16 +214,8 @@ def main():
                 if sent_acc >= MAX_PER_ACCOUNT:
                     break
 
-            # Warmup: لا نرسل شيء أول مرة (لكن هنا نرسل فقط آخر 3 ساعات أصلاً، فآمن)
-            # ومع ذلك نخلي warmup على آخر عنصر لتثبيت نقطة البداية.
-            if first_run and entries:
-                # store newest link
-                newest_link = (getattr(entries[0], "link", "") or "").strip()
-                if newest_link:
-                    state[acc] = newest_link
-
-            # Normal: update state to newest link to avoid duplicates
-            if not first_run and entries:
+            # تحديث state لأحدث رابط (منع التكرار)
+            if entries:
                 newest_link = (getattr(entries[0], "link", "") or "").strip()
                 if newest_link:
                     state[acc] = newest_link
