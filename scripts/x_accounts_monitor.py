@@ -10,9 +10,6 @@ from urllib.parse import quote_plus
 import requests
 import feedparser
 
-# =========================
-# CONFIG
-# =========================
 ACCOUNTS = [
     "SaudiNews50",
     "alekhbariyatv",
@@ -31,11 +28,11 @@ KSA_TZ = ZoneInfo("Asia/Riyadh")
 REQUEST_TIMEOUT = 25
 MAX_PER_ACCOUNT = 3
 
-# Google News RSS locale
 GN_PARAMS = "hl=ar&gl=SA&ceid=SA:ar"
 
-# فلتر الكلمات المهمة
 USE_KEYWORDS = True
+TEST_MODE = True   # مهم: خله True للاختبار الآن
+
 KEYWORDS = [
     "بيان",
     "عاجل",
@@ -47,8 +44,6 @@ KEYWORDS = [
     "emergency",
 ]
 
-# وضع التهيئة الأولية:
-# أول تشغيل فقط يخزن آخر نقطة بداية ولا يرسل القديم
 WARMUP_ON_FIRST_RUN = True
 
 
@@ -68,9 +63,6 @@ def now_ksa_str() -> str:
 
 
 def telegram_send(text: str, preview: bool = False) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secrets.")
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     r = requests.post(
         url,
@@ -114,7 +106,6 @@ def resolve_final_url(google_news_url: str) -> str:
 
 
 def build_google_news_rss_url(account: str) -> str:
-    # نبحث عن روابط تغريدات تخص الحساب
     q = f"site:x.com/{account}"
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&{GN_PARAMS}"
 
@@ -163,8 +154,8 @@ def main():
 
             last_seen = state.get(acc)
 
-            # أول تشغيل: warmup فقط
-            if first_run and WARMUP_ON_FIRST_RUN and entries:
+            # مهم: لا تطبق warmup إذا TEST_MODE شغال
+            if first_run and WARMUP_ON_FIRST_RUN and entries and (not TEST_MODE):
                 newest_link = (getattr(entries[0], "link", "") or "").strip()
                 if newest_link:
                     state[acc] = newest_link
@@ -178,8 +169,7 @@ def main():
                 if not gn_link:
                     continue
 
-                # وقف عند آخر عنصر سبق إرساله/تسجيله
-                if last_seen and gn_link == last_seen:
+                if last_seen and gn_link == last_seen and (not TEST_MODE):
                     break
 
                 final_url = resolve_final_url(gn_link)
@@ -187,7 +177,6 @@ def main():
                     resolved_fail += 1
                     continue
 
-                # لازم يكون الرابط النهائي تغريدة من نفس الحساب
                 if not pat.match(final_url):
                     rejected_bad_url += 1
                     continue
@@ -196,20 +185,23 @@ def main():
                 if not title:
                     continue
 
-                # فلتر الكلمات
-                if USE_KEYWORDS and (not keyword_match(title)):
+                if USE_KEYWORDS and (not keyword_match(title)) and (not TEST_MODE):
                     rejected_no_kw += 1
                     continue
 
-                telegram_send(build_msg(acc, title, final_url), preview=True)
+                note = "TEST_MODE"
+                telegram_send(build_msg(acc, title, final_url, note=note), preview=True)
                 sent_acc += 1
                 total_sent += 1
                 time.sleep(0.8)
 
+                # في وضع الاختبار نرسل أول نتيجة فقط
+                if TEST_MODE:
+                    break
+
                 if sent_acc >= MAX_PER_ACCOUNT:
                     break
 
-            # تحديث state إلى أحدث رابط ظهر
             if entries:
                 newest_link = (getattr(entries[0], "link", "") or "").strip()
                 if newest_link:
@@ -234,6 +226,7 @@ def main():
         f"Sent: {total_sent}\n"
         f"Mode: {'warmup' if first_run else 'normal'}\n"
         f"Keywords: {'ON' if USE_KEYWORDS else 'OFF'}\n"
+        f"TEST_MODE: {'ON' if TEST_MODE else 'OFF'}\n"
         "════════════════════\n"
         + "\n".join(lines),
         preview=False
